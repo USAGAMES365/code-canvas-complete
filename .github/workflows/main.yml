@@ -1,0 +1,26 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs every day at midnight UTC
+  workflow_dispatch:      # Allows you to run this manually from the Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to push changes back to your fork
+
+    steps:
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Required to fetch all history for a clean merge
+
+      - name: Sync from Upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Use GitHub CLI to sync the branch named 'main'
+          # Replace 'main' with your branch name if different
+          gh repo sync ${{ github.repository }} -b main
