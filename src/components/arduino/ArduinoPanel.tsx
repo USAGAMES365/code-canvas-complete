@@ -2,14 +2,14 @@ import { useState, useEffect } from 'react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { BreadboardVisualizer } from './BreadboardVisualizer';
 import { LibraryManager } from './LibraryManager';
-import { ArduinoUploadDialog } from './ArduinoUploadDialog';
+import { ArduinoUploadDialog, UploadConfig } from './ArduinoUploadDialog';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { FileNode, BreadboardCircuit } from '@/types/ide';
 import { Upload, Zap } from 'lucide-react';
-import { arduinoLibraries } from '@/data/arduinoTemplates';
+import { arduinoLibraries, arduinoBoards } from '@/data/arduinoTemplates';
 
 interface ArduinoPanelProps {
   files: FileNode[];
@@ -21,11 +21,16 @@ interface ArduinoPanelProps {
   currentTemplate: string;
 }
 
-const arduinoBoards: Record<string, { name: string }> = {
-  uno: { name: 'Arduino Uno' },
-  nano: { name: 'Arduino Nano' },
-  mega: { name: 'Arduino Mega' },
-  leonardo: { name: 'Arduino Leonardo' },
+/** Recursively find a file by name */
+const findFileByName = (nodes: FileNode[], name: string): FileNode | undefined => {
+  for (const n of nodes) {
+    if (n.type === 'file' && n.name === name) return n;
+    if (n.children) {
+      const found = findFileByName(n.children, name);
+      if (found) return found;
+    }
+  }
+  return undefined;
 };
 
 export function ArduinoPanel({ files, onFileUpdate, onAddFile, currentTemplate }: ArduinoPanelProps) {
@@ -40,10 +45,10 @@ export function ArduinoPanel({ files, onFileUpdate, onAddFile, currentTemplate }
     code: '',
   });
 
-  const sketchFile = files.find((f) => f.name === 'sketch.ino');
-  const circuitFile = files.find((f) => f.name === 'circuit.json');
+  const sketchFile = findFileByName(files, 'sketch.ino');
+  const circuitFile = findFileByName(files, 'circuit.json');
 
-  // Load circuit from file (or create one if missing)
+  // Load circuit from file
   useEffect(() => {
     if (circuitFile && circuitFile.content) {
       try {
@@ -52,17 +57,6 @@ export function ArduinoPanel({ files, onFileUpdate, onAddFile, currentTemplate }
       } catch (e) {
         console.error('Failed to parse circuit.json');
       }
-    } else if (!circuitFile && onAddFile) {
-      // if there's no circuit file yet, create a blank one so state can persist
-      const placeholder: BreadboardCircuit = {
-        id: `circuit-${Date.now()}`,
-        boardId: circuit.boardId,
-        components: circuit.components,
-        connections: circuit.connections || [],
-        wires: circuit.wires || [],
-        code: circuit.code,
-      };
-      onAddFile('circuit.json', JSON.stringify(placeholder, null, 2), 'json');
     }
   }, [circuitFile?.id]);
 
@@ -150,7 +144,7 @@ export function ArduinoPanel({ files, onFileUpdate, onAddFile, currentTemplate }
             </div>
             <div>
               <Label>Flash Memory</Label>
-              <p className="text-sm text-gray-300">32KB</p>
+              <p className="text-sm text-gray-300">{arduinoBoards[circuit.boardId]?.flash || 32}KB</p>
             </div>
             <div>
               <Label>Selected Libraries</Label>
@@ -167,14 +161,17 @@ export function ArduinoPanel({ files, onFileUpdate, onAddFile, currentTemplate }
       <ArduinoUploadDialog
         open={uploadDialogOpen}
         onOpenChange={setUploadDialogOpen}
-        onUpload={async (config) => {
-          // Handle upload
+        onUpload={async (config: UploadConfig, onProgress?: (message: string, percent?: number) => void) => {
           const { ArduinoUploadService } = await import('@/services/arduinoUploadService');
-          if (config.uploadMethod === 'serial') {
-            await ArduinoUploadService.uploadViaSerial(getSketchWithLibraries(), config);
-          } else {
-            await ArduinoUploadService.uploadViaBackend(getSketchWithLibraries(), config);
+          if (config.uploadMethod === 'wifi') {
+            await ArduinoUploadService.uploadViaWiFi(getSketchWithLibraries(), config, onProgress);
+            return;
           }
+          if (config.uploadMethod === 'bluetooth') {
+            await ArduinoUploadService.uploadViaBluetooth(getSketchWithLibraries(), config, onProgress);
+            return;
+          }
+          await ArduinoUploadService.uploadViaSerial(getSketchWithLibraries(), config, onProgress);
         }}
         sketchCode={getSketchWithLibraries()}
       />
