@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, useEffect } from 'react';
+import { useMemo, useRef, useState, useEffect, useCallback } from 'react';
 import {
   StopCircle,
   Maximize2,
@@ -7,7 +7,7 @@ import {
   Volume2,
   Brush,
   Code2,
-  Search,
+  // Search removed - unused
   ZoomIn,
   ZoomOut,
   CircleMinus,
@@ -20,6 +20,9 @@ import {
 } from 'lucide-react';
 import VirtualMachine from 'scratch-vm';
 import { ScratchArchive, exportSb3, importSb3 } from '@/services/scratchSb3';
+import { ScratchBlockShape, getBlockShape } from './ScratchBlockShape';
+import { ScratchLibraryDialog, type LibraryMode } from './ScratchLibraryDialog';
+import { type ScratchLibraryAsset, assetUrl } from '@/data/scratchLibrary';
 
 type ScratchInputPrimitive = string | number | boolean;
 
@@ -75,6 +78,9 @@ interface ScratchVmLike {
   stopAll: () => void;
   greenFlag: () => void;
   loadProject: (projectData: ArrayBuffer) => Promise<void>;
+  attachRenderer: (renderer: unknown) => void;
+  attachStorage: (storage: unknown) => void;
+  attachAudioEngine: (audioEngine: unknown) => void;
 }
 
 interface ScratchPanelProps {
@@ -92,6 +98,91 @@ type ScratchBlockDef = {
   inputs?: Record<string, unknown>;
   fields?: Record<string, unknown>;
   action?: 'create_variable' | 'create_list';
+};
+// Fallback 2D canvas renderer when scratch-render (WebGL) doesn't produce output
+const fallbackImageCache = new Map<string, HTMLImageElement>();
+
+const drawFallbackStage = (
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  archive: ScratchArchive | null,
+  vm: ScratchVmLike | null,
+) => {
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, w, h);
+
+  if (!archive) return;
+
+  let project: ScratchProject | null = null;
+  try {
+    project = JSON.parse(archive.projectJson) as ScratchProject;
+  } catch { return; }
+  if (!project?.targets) return;
+
+  const imgMime = (fmt: string | undefined) => {
+    const f = fmt || 'png';
+    return f === 'svg' ? 'image/svg+xml' : `image/${f}`;
+  };
+
+  const loadImg = (md5ext: string, dataFormat?: string): HTMLImageElement | null => {
+    const cached = fallbackImageCache.get(md5ext);
+    if (cached?.complete && cached.naturalWidth > 0) return cached;
+    if (cached) return null; // still loading
+    const b64 = archive.files?.[md5ext];
+    if (!b64) return null;
+    const img = new Image();
+    img.src = `data:${imgMime(dataFormat)};base64,${b64}`;
+    fallbackImageCache.set(md5ext, img);
+    return null; // will render next frame
+  };
+
+  // Draw stage backdrop
+  const stage = project.targets.find((t) => t.isStage);
+  if (stage?.costumes?.length) {
+    const idx = Number(stage.currentCostume || 0);
+    const costume = stage.costumes[idx] || stage.costumes[0];
+    if (costume) {
+      const img = loadImg(costume.md5ext, costume.dataFormat);
+      if (img) {
+        ctx.drawImage(img, 0, 0, w, h);
+      }
+    }
+  }
+
+  // Draw sprites
+  const runtimeTargets = vm?.runtime?.targets;
+  for (const target of project.targets) {
+    if (target.isStage) continue;
+    // Use runtime position if available
+    const rt = runtimeTargets?.find((t) => t.sprite?.name === target.name);
+    const visible = rt ? rt.visible !== false : true;
+    if (!visible) continue;
+
+    const costumes = target.costumes || [];
+    const costumeIdx = Number(target.currentCostume || 0);
+    const costume = costumes[costumeIdx] || costumes[0];
+    if (!costume) continue;
+
+    const img = loadImg(costume.md5ext, costume.dataFormat);
+    if (!img) continue;
+
+    const x = (rt?.x ?? 0) + w / 2;
+    const y = h / 2 - (rt?.y ?? 0);
+    const bitmapRes = (costume as Record<string, unknown>).bitmapResolution as number || (costume.dataFormat === 'svg' ? 1 : 2);
+    const cx = (costume.rotationCenterX || 0) / bitmapRes;
+    const cy = (costume.rotationCenterY || 0) / bitmapRes;
+    const drawW = img.naturalWidth / bitmapRes;
+    const drawH = img.naturalHeight / bitmapRes;
+
+    ctx.save();
+    ctx.translate(x, y);
+    const dir = (rt?.direction ?? 90) - 90;
+    if (Math.abs(dir) > 0.1) ctx.rotate((dir * Math.PI) / 180);
+    ctx.drawImage(img, -cx, -cy, drawW, drawH);
+    ctx.restore();
+  }
 };
 
 
@@ -132,130 +223,159 @@ const DEFAULT_PROJECT: ScratchProject = {
 
 const categoryBlocks: Record<string, ScratchBlockDef[]> = {
   Motion: [
-    { label: 'move 10 steps', opcode: 'motion_movesteps', inputs: { STEPS: [1, [4, '10']] } },
-    { label: 'turn ⟳ 15 degrees', opcode: 'motion_turnright', inputs: { DEGREES: [1, [4, '15']] } },
-    { label: 'turn ⟲ 15 degrees', opcode: 'motion_turnleft', inputs: { DEGREES: [1, [4, '15']] } },
-    { label: 'go to random position', opcode: 'motion_goto', fields: { TO: ['_random_', null] } },
-    { label: 'go to x: 0  y: 0', opcode: 'motion_gotoxy', inputs: { X: [1, [4, '0']], Y: [1, [4, '0']] } },
-    { label: 'glide 1 secs to random position', opcode: 'motion_glideto', inputs: { SECS: [1, [4, '1']] }, fields: { TO: ['_random_', null] } },
-    { label: 'glide 1 secs to x: 0  y: 0', opcode: 'motion_glidesecstoxy', inputs: { SECS: [1, [4, '1']], X: [1, [4, '0']], Y: [1, [4, '0']] } },
-    { label: 'point in direction 90', opcode: 'motion_pointindirection', inputs: { DIRECTION: [1, [4, '90']] } },
-    { label: 'point towards mouse-pointer', opcode: 'motion_pointtowards', fields: { TOWARDS: ['_mouse_', null] } },
-    { label: 'change x by 10', opcode: 'motion_changexby', inputs: { DX: [1, [4, '10']] } },
-    { label: 'set x to 0', opcode: 'motion_setx', inputs: { X: [1, [4, '0']] } },
-    { label: 'change y by 10', opcode: 'motion_changeyby', inputs: { DY: [1, [4, '10']] } },
-    { label: 'set y to 0', opcode: 'motion_sety', inputs: { Y: [1, [4, '0']] } },
+    { label: 'move [10] steps', opcode: 'motion_movesteps', inputs: { STEPS: [1, [4, '10']] } },
+    { label: 'turn ⟳ [15] degrees', opcode: 'motion_turnright', inputs: { DEGREES: [1, [4, '15']] } },
+    { label: 'turn ⟲ [15] degrees', opcode: 'motion_turnleft', inputs: { DEGREES: [1, [4, '15']] } },
+    { label: 'go to {random position}', opcode: 'motion_goto', fields: { TO: ['_random_', null] } },
+    { label: 'go to x: [0]  y: [0]', opcode: 'motion_gotoxy', inputs: { X: [1, [4, '0']], Y: [1, [4, '0']] } },
+    { label: 'glide [1] secs to {random position}', opcode: 'motion_glideto', inputs: { SECS: [1, [4, '1']] }, fields: { TO: ['_random_', null] } },
+    { label: 'glide [1] secs to x: [0]  y: [0]', opcode: 'motion_glidesecstoxy', inputs: { SECS: [1, [4, '1']], X: [1, [4, '0']], Y: [1, [4, '0']] } },
+    { label: 'point in direction [90]', opcode: 'motion_pointindirection', inputs: { DIRECTION: [1, [4, '90']] } },
+    { label: 'point towards {mouse-pointer}', opcode: 'motion_pointtowards', fields: { TOWARDS: ['_mouse_', null] } },
+    { label: 'change x by [10]', opcode: 'motion_changexby', inputs: { DX: [1, [4, '10']] } },
+    { label: 'set x to [0]', opcode: 'motion_setx', inputs: { X: [1, [4, '0']] } },
+    { label: 'change y by [10]', opcode: 'motion_changeyby', inputs: { DY: [1, [4, '10']] } },
+    { label: 'set y to [0]', opcode: 'motion_sety', inputs: { Y: [1, [4, '0']] } },
     { label: 'if on edge, bounce', opcode: 'motion_ifonedgebounce' },
+    { label: 'set rotation style {left-right}', opcode: 'motion_setrotationstyle', fields: { STYLE: ['left-right', null] } },
+    { label: 'x position', opcode: 'motion_xposition' },
+    { label: 'y position', opcode: 'motion_yposition' },
+    { label: 'direction', opcode: 'motion_direction' },
   ],
   Looks: [
-    { label: 'say Hello! for 2 seconds', opcode: 'looks_sayforsecs', inputs: { MESSAGE: [1, [10, 'Hello!']], SECS: [1, [4, '2']] } },
-    { label: 'say Hello!', opcode: 'looks_say', inputs: { MESSAGE: [1, [10, 'Hello!']] } },
-    { label: 'think Hmm... for 2 seconds', opcode: 'looks_thinkforsecs', inputs: { MESSAGE: [1, [10, 'Hmm...']], SECS: [1, [4, '2']] } },
-    { label: 'think Hmm...', opcode: 'looks_think', inputs: { MESSAGE: [1, [10, 'Hmm...']] } },
-    { label: 'switch costume to', opcode: 'looks_switchcostumeto' },
+    { label: 'say [Hello!] for [2] seconds', opcode: 'looks_sayforsecs', inputs: { MESSAGE: [1, [10, 'Hello!']], SECS: [1, [4, '2']] } },
+    { label: 'say [Hello!]', opcode: 'looks_say', inputs: { MESSAGE: [1, [10, 'Hello!']] } },
+    { label: 'think [Hmm...] for [2] seconds', opcode: 'looks_thinkforsecs', inputs: { MESSAGE: [1, [10, 'Hmm...']], SECS: [1, [4, '2']] } },
+    { label: 'think [Hmm...]', opcode: 'looks_think', inputs: { MESSAGE: [1, [10, 'Hmm...']] } },
+    { label: 'switch costume to {costume1}', opcode: 'looks_switchcostumeto', fields: { COSTUME: ['costume1', null] } },
     { label: 'next costume', opcode: 'looks_nextcostume' },
-    { label: 'switch backdrop to', opcode: 'looks_switchbackdropto' },
+    { label: 'switch backdrop to {backdrop1}', opcode: 'looks_switchbackdropto', fields: { BACKDROP: ['backdrop1', null] } },
     { label: 'next backdrop', opcode: 'looks_nextbackdrop' },
-    { label: 'change size by 10', opcode: 'looks_changesizeby', inputs: { CHANGE: [1, [4, '10']] } },
-    { label: 'set size to 100%', opcode: 'looks_setsizeto', inputs: { SIZE: [1, [4, '100']] } },
-    { label: 'change color effect by 25', opcode: 'looks_changeeffectby', inputs: { CHANGE: [1, [4, '25']] }, fields: { EFFECT: ['COLOR', null] } },
-    { label: 'set color effect to 0', opcode: 'looks_seteffectto', inputs: { VALUE: [1, [4, '0']] }, fields: { EFFECT: ['COLOR', null] } },
+    { label: 'change size by [10]', opcode: 'looks_changesizeby', inputs: { CHANGE: [1, [4, '10']] } },
+    { label: 'set size to [100] %', opcode: 'looks_setsizeto', inputs: { SIZE: [1, [4, '100']] } },
+    { label: 'change {color} effect by [25]', opcode: 'looks_changeeffectby', inputs: { CHANGE: [1, [4, '25']] }, fields: { EFFECT: ['COLOR', null] } },
+    { label: 'set {color} effect to [0]', opcode: 'looks_seteffectto', inputs: { VALUE: [1, [4, '0']] }, fields: { EFFECT: ['COLOR', null] } },
     { label: 'clear graphic effects', opcode: 'looks_cleargraphiceffects' },
     { label: 'show', opcode: 'looks_show' },
     { label: 'hide', opcode: 'looks_hide' },
-    { label: 'go to front layer', opcode: 'looks_gotofrontback', fields: { FRONT_BACK: ['front', null] } },
-    { label: 'go back 1 layers', opcode: 'looks_goforwardbackwardlayers', inputs: { NUM: [1, [4, '1']] }, fields: { FORWARD_BACKWARD: ['backward', null] } },
+    { label: 'go to {front} layer', opcode: 'looks_gotofrontback', fields: { FRONT_BACK: ['front', null] } },
+    { label: 'go {backward} [1] layers', opcode: 'looks_goforwardbackwardlayers', inputs: { NUM: [1, [4, '1']] }, fields: { FORWARD_BACKWARD: ['backward', null] } },
+    { label: 'costume #', opcode: 'looks_costumenumbername', fields: { NUMBER_NAME: ['number', null] } },
+    { label: 'backdrop #', opcode: 'looks_backdropnumbername', fields: { NUMBER_NAME: ['number', null] } },
+    { label: 'size', opcode: 'looks_size' },
   ],
   Sound: [
-    { label: 'play sound until done', opcode: 'sound_playuntildone' },
-    { label: 'start sound', opcode: 'sound_play' },
+    { label: 'play sound {Meow} until done', opcode: 'sound_playuntildone', fields: { SOUND_MENU: ['pop', null] } },
+    { label: 'start sound {Meow}', opcode: 'sound_play', fields: { SOUND_MENU: ['pop', null] } },
     { label: 'stop all sounds', opcode: 'sound_stopallsounds' },
-    { label: 'change pitch effect by 10', opcode: 'sound_changeeffectby', inputs: { VALUE: [1, [4, '10']] }, fields: { EFFECT: ['PITCH', null] } },
-    { label: 'set pitch effect to 100', opcode: 'sound_seteffectto', inputs: { VALUE: [1, [4, '100']] }, fields: { EFFECT: ['PITCH', null] } },
+    { label: 'change {pitch} effect by [10]', opcode: 'sound_changeeffectby', inputs: { VALUE: [1, [4, '10']] }, fields: { EFFECT: ['PITCH', null] } },
+    { label: 'set {pitch} effect to [100]', opcode: 'sound_seteffectto', inputs: { VALUE: [1, [4, '100']] }, fields: { EFFECT: ['PITCH', null] } },
     { label: 'clear sound effects', opcode: 'sound_cleareffects' },
-    { label: 'change volume by -10', opcode: 'sound_changevolumeby', inputs: { VOLUME: [1, [4, '-10']] } },
-    { label: 'set volume to 100%', opcode: 'sound_setvolumeto', inputs: { VOLUME: [1, [4, '100']] } },
+    { label: 'change volume by [-10]', opcode: 'sound_changevolumeby', inputs: { VOLUME: [1, [4, '-10']] } },
+    { label: 'set volume to [100] %', opcode: 'sound_setvolumeto', inputs: { VOLUME: [1, [4, '100']] } },
+    { label: 'volume', opcode: 'sound_volume' },
   ],
   Events: [
     { label: 'when 🏴 clicked', opcode: 'event_whenflagclicked' },
-    { label: 'when space key pressed', opcode: 'event_whenkeypressed', fields: { KEY_OPTION: ['space', null] } },
+    { label: 'when {space} key pressed', opcode: 'event_whenkeypressed', fields: { KEY_OPTION: ['space', null] } },
     { label: 'when this sprite clicked', opcode: 'event_whenthisspriteclicked' },
-    { label: 'when backdrop switches to', opcode: 'event_whenbackdropswitchesto' },
-    { label: 'when loudness > 10', opcode: 'event_whengreaterthan', inputs: { VALUE: [1, [4, '10']] }, fields: { WHENGREATERTHANMENU: ['LOUDNESS', null] } },
-    { label: 'when I receive message1', opcode: 'event_whenbroadcastreceived', fields: { BROADCAST_OPTION: ['message1', null] } },
-    { label: 'broadcast message1', opcode: 'event_broadcast', inputs: { BROADCAST_INPUT: [1, [11, 'message1', 'message1']] } },
-    { label: 'broadcast message1 and wait', opcode: 'event_broadcastandwait', inputs: { BROADCAST_INPUT: [1, [11, 'message1', 'message1']] } },
+    { label: 'when backdrop switches to {backdrop1}', opcode: 'event_whenbackdropswitchesto', fields: { BACKDROP: ['backdrop1', null] } },
+    { label: 'when {loudness} > [10]', opcode: 'event_whengreaterthan', inputs: { VALUE: [1, [4, '10']] }, fields: { WHENGREATERTHANMENU: ['LOUDNESS', null] } },
+    { label: 'when I receive {message1}', opcode: 'event_whenbroadcastreceived', fields: { BROADCAST_OPTION: ['message1', null] } },
+    { label: 'broadcast {message1}', opcode: 'event_broadcast', inputs: { BROADCAST_INPUT: [1, [11, 'message1', 'message1']] } },
+    { label: 'broadcast {message1} and wait', opcode: 'event_broadcastandwait', inputs: { BROADCAST_INPUT: [1, [11, 'message1', 'message1']] } },
   ],
   Control: [
-    { label: 'wait 1 seconds', opcode: 'control_wait', inputs: { DURATION: [1, [4, '1']] } },
-    { label: 'repeat 10', opcode: 'control_repeat', inputs: { TIMES: [1, [4, '10']] } },
+    { label: 'wait [1] seconds', opcode: 'control_wait', inputs: { DURATION: [1, [4, '1']] } },
+    { label: 'repeat [10]', opcode: 'control_repeat', inputs: { TIMES: [1, [4, '10']] } },
     { label: 'forever', opcode: 'control_forever' },
-    { label: 'if < > then', opcode: 'control_if' },
-    { label: 'if < > then else', opcode: 'control_if_else' },
-    { label: 'wait until < >', opcode: 'control_wait_until' },
-    { label: 'repeat until < >', opcode: 'control_repeat_until' },
-    { label: 'stop all', opcode: 'control_stop', fields: { STOP_OPTION: ['all', null] } },
+    { label: 'if <> then', opcode: 'control_if' },
+    { label: 'if <> then else', opcode: 'control_if_else' },
+    { label: 'wait until <>', opcode: 'control_wait_until' },
+    { label: 'repeat until <>', opcode: 'control_repeat_until' },
+    { label: 'stop {all}', opcode: 'control_stop', fields: { STOP_OPTION: ['all', null] } },
     { label: 'when I start as a clone', opcode: 'control_start_as_clone' },
-    { label: 'create clone of myself', opcode: 'control_create_clone_of', fields: { CLONE_OPTION: ['_myself_', null] } },
+    { label: 'create clone of {myself}', opcode: 'control_create_clone_of', fields: { CLONE_OPTION: ['_myself_', null] } },
     { label: 'delete this clone', opcode: 'control_delete_this_clone' },
   ],
   Sensing: [
-    { label: 'touching mouse-pointer?', opcode: 'sensing_touchingobject', fields: { TOUCHINGOBJECTMENU: ['_mouse_', null] } },
-    { label: 'touching color?', opcode: 'sensing_touchingcolor' },
-    { label: 'color is touching?', opcode: 'sensing_coloristouchingcolor' },
-    { label: 'distance to mouse-pointer', opcode: 'sensing_distanceto', fields: { DISTANCETOMENU: ['_mouse_', null] } },
-    { label: 'ask What is your name? and wait', opcode: 'sensing_askandwait', inputs: { QUESTION: [1, [10, 'What is your name?']] } },
+    { label: 'touching {mouse-pointer} ?', opcode: 'sensing_touchingobject', fields: { TOUCHINGOBJECTMENU: ['_mouse_', null] } },
+    { label: 'touching color [#0000ff] ?', opcode: 'sensing_touchingcolor', inputs: { COLOR: [1, [9, '#0000ff']] } },
+    { label: 'color [#0000ff] is touching [#ff0000] ?', opcode: 'sensing_coloristouchingcolor', inputs: { COLOR: [1, [9, '#0000ff']], COLOR2: [1, [9, '#ff0000']] } },
+    { label: 'distance to {mouse-pointer}', opcode: 'sensing_distanceto', fields: { DISTANCETOMENU: ['_mouse_', null] } },
+    { label: 'ask [What is your name?] and wait', opcode: 'sensing_askandwait', inputs: { QUESTION: [1, [10, 'What is your name?']] } },
     { label: 'answer', opcode: 'sensing_answer' },
-    { label: 'key space pressed?', opcode: 'sensing_keypressed', fields: { KEY_OPTION: ['space', null] } },
+    { label: 'key {space} pressed?', opcode: 'sensing_keypressed', fields: { KEY_OPTION: ['space', null] } },
     { label: 'mouse down?', opcode: 'sensing_mousedown' },
     { label: 'mouse x', opcode: 'sensing_mousex' },
     { label: 'mouse y', opcode: 'sensing_mousey' },
+    { label: '{backdrop #} of {Stage}', opcode: 'sensing_of', inputs: { PROPERTY: [1, [10, 'backdrop #']] }, fields: { OBJECT: ['_stage_', null] } },
     { label: 'loudness', opcode: 'sensing_loudness' },
     { label: 'timer', opcode: 'sensing_timer' },
     { label: 'reset timer', opcode: 'sensing_resettimer' },
-    { label: 'current year', opcode: 'sensing_current', fields: { CURRENTMENU: ['YEAR', null] } },
+    { label: 'current {year}', opcode: 'sensing_current', fields: { CURRENTMENU: ['YEAR', null] } },
     { label: 'days since 2000', opcode: 'sensing_dayssince2000' },
+    { label: 'username', opcode: 'sensing_username' },
   ],
   Operators: [
-    { label: '( ) + ( )', opcode: 'operator_add', inputs: { NUM1: [1, [4, '']], NUM2: [1, [4, '']] } },
-    { label: '( ) - ( )', opcode: 'operator_subtract', inputs: { NUM1: [1, [4, '']], NUM2: [1, [4, '']] } },
-    { label: '( ) * ( )', opcode: 'operator_multiply', inputs: { NUM1: [1, [4, '']], NUM2: [1, [4, '']] } },
-    { label: '( ) / ( )', opcode: 'operator_divide', inputs: { NUM1: [1, [4, '']], NUM2: [1, [4, '']] } },
-    { label: 'pick random 1 to 10', opcode: 'operator_random', inputs: { FROM: [1, [4, '1']], TO: [1, [4, '10']] } },
-    { label: '( ) > ( )', opcode: 'operator_gt', inputs: { OPERAND1: [1, [10, '']], OPERAND2: [1, [10, '']] } },
-    { label: '( ) < ( )', opcode: 'operator_lt', inputs: { OPERAND1: [1, [10, '']], OPERAND2: [1, [10, '']] } },
-    { label: '( ) = ( )', opcode: 'operator_equals', inputs: { OPERAND1: [1, [10, '']], OPERAND2: [1, [10, '']] } },
-    { label: '( ) and ( )', opcode: 'operator_and' },
-    { label: '( ) or ( )', opcode: 'operator_or' },
-    { label: 'not ( )', opcode: 'operator_not' },
-    { label: 'join apple banana', opcode: 'operator_join', inputs: { STRING1: [1, [10, 'apple']], STRING2: [1, [10, 'banana']] } },
-    { label: 'letter 1 of apple', opcode: 'operator_letter_of', inputs: { LETTER: [1, [4, '1']], STRING: [1, [10, 'apple']] } },
-    { label: 'length of apple', opcode: 'operator_length', inputs: { STRING: [1, [10, 'apple']] } },
-    { label: 'apple contains a?', opcode: 'operator_contains', inputs: { STRING1: [1, [10, 'apple']], STRING2: [1, [10, 'a']] } },
-    { label: '( ) mod ( )', opcode: 'operator_mod', inputs: { NUM1: [1, [4, '']], NUM2: [1, [4, '']] } },
-    { label: 'round ( )', opcode: 'operator_round', inputs: { NUM: [1, [4, '']] } },
-    { label: 'abs of ( )', opcode: 'operator_mathop', inputs: { NUM: [1, [4, '']] }, fields: { OPERATOR: ['abs', null] } },
+    { label: '[  ] + [  ]', opcode: 'operator_add', inputs: { NUM1: [1, [4, '']], NUM2: [1, [4, '']] } },
+    { label: '[  ] - [  ]', opcode: 'operator_subtract', inputs: { NUM1: [1, [4, '']], NUM2: [1, [4, '']] } },
+    { label: '[  ] * [  ]', opcode: 'operator_multiply', inputs: { NUM1: [1, [4, '']], NUM2: [1, [4, '']] } },
+    { label: '[  ] / [  ]', opcode: 'operator_divide', inputs: { NUM1: [1, [4, '']], NUM2: [1, [4, '']] } },
+    { label: 'pick random [1] to [10]', opcode: 'operator_random', inputs: { FROM: [1, [4, '1']], TO: [1, [4, '10']] } },
+    { label: '[  ] > [  ]', opcode: 'operator_gt', inputs: { OPERAND1: [1, [10, '']], OPERAND2: [1, [10, '']] } },
+    { label: '[  ] < [  ]', opcode: 'operator_lt', inputs: { OPERAND1: [1, [10, '']], OPERAND2: [1, [10, '']] } },
+    { label: '[  ] = [  ]', opcode: 'operator_equals', inputs: { OPERAND1: [1, [10, '']], OPERAND2: [1, [10, '']] } },
+    { label: '<> and <>', opcode: 'operator_and' },
+    { label: '<> or <>', opcode: 'operator_or' },
+    { label: 'not <>', opcode: 'operator_not' },
+    { label: 'join [apple] [banana]', opcode: 'operator_join', inputs: { STRING1: [1, [10, 'apple']], STRING2: [1, [10, 'banana']] } },
+    { label: 'letter [1] of [apple]', opcode: 'operator_letter_of', inputs: { LETTER: [1, [4, '1']], STRING: [1, [10, 'apple']] } },
+    { label: 'length of [apple]', opcode: 'operator_length', inputs: { STRING: [1, [10, 'apple']] } },
+    { label: '[apple] contains [a] ?', opcode: 'operator_contains', inputs: { STRING1: [1, [10, 'apple']], STRING2: [1, [10, 'a']] } },
+    { label: '[  ] mod [  ]', opcode: 'operator_mod', inputs: { NUM1: [1, [4, '']], NUM2: [1, [4, '']] } },
+    { label: 'round [  ]', opcode: 'operator_round', inputs: { NUM: [1, [4, '']] } },
+    { label: '{abs} of [  ]', opcode: 'operator_mathop', inputs: { NUM: [1, [4, '']] }, fields: { OPERATOR: ['abs', null] } },
   ],
   Variables: [
-    { label: 'Make a Variable', opcode: 'data_setvariableto', inputs: { VALUE: [1, [10, '0']] }, action: 'create_variable' },
-    { label: 'Make a List', opcode: 'data_addtolist', inputs: { ITEM: [1, [10, 'thing']] }, action: 'create_list' },
-    { label: 'set my variable to 0', opcode: 'data_setvariableto', inputs: { VALUE: [1, [10, '0']] } },
-    { label: 'change my variable by 1', opcode: 'data_changevariableby', inputs: { VALUE: [1, [4, '1']] } },
+    { label: 'set my variable to [0]', opcode: 'data_setvariableto', inputs: { VALUE: [1, [10, '0']] } },
+    { label: 'change my variable by [1]', opcode: 'data_changevariableby', inputs: { VALUE: [1, [4, '1']] } },
     { label: 'show variable', opcode: 'data_showvariable' },
     { label: 'hide variable', opcode: 'data_hidevariable' },
-    { label: 'add thing to list', opcode: 'data_addtolist', inputs: { ITEM: [1, [10, 'thing']] } },
-    { label: 'delete 1 of list', opcode: 'data_deleteoflist', inputs: { INDEX: [1, [4, '1']] } },
-    { label: 'delete all of list', opcode: 'data_deletealloflist' },
-    { label: 'insert thing at 1 of list', opcode: 'data_insertatlist', inputs: { ITEM: [1, [10, 'thing']], INDEX: [1, [4, '1']] } },
-    { label: 'replace item 1 of list with thing', opcode: 'data_replaceitemoflist', inputs: { INDEX: [1, [4, '1']], ITEM: [1, [10, 'thing']] } },
-    { label: 'item 1 of list', opcode: 'data_itemoflist', inputs: { INDEX: [1, [4, '1']] } },
-    { label: 'length of list', opcode: 'data_lengthoflist' },
-    { label: 'list contains thing?', opcode: 'data_listcontainsitem', inputs: { ITEM: [1, [10, 'thing']] } },
-    { label: 'show list', opcode: 'data_showlist' },
-    { label: 'hide list', opcode: 'data_hidelist' },
+    { label: 'add [thing] to my list', opcode: 'data_addtolist', inputs: { ITEM: [1, [10, 'thing']] } },
+    { label: 'delete [1] of my list', opcode: 'data_deleteoflist', inputs: { INDEX: [1, [4, '1']] } },
+    { label: 'delete all of my list', opcode: 'data_deletealloflist' },
+    { label: 'insert [thing] at [1] of my list', opcode: 'data_insertatlist', inputs: { ITEM: [1, [10, 'thing']], INDEX: [1, [4, '1']] } },
+    { label: 'replace item [1] of my list with [thing]', opcode: 'data_replaceitemoflist', inputs: { INDEX: [1, [4, '1']], ITEM: [1, [10, 'thing']] } },
+    { label: 'item [1] of my list', opcode: 'data_itemoflist', inputs: { INDEX: [1, [4, '1']] } },
+    { label: 'item # of [thing] in my list', opcode: 'data_itemnumoflist', inputs: { ITEM: [1, [10, 'thing']] } },
+    { label: 'length of my list', opcode: 'data_lengthoflist' },
+    { label: 'my list contains [thing] ?', opcode: 'data_listcontainsitem', inputs: { ITEM: [1, [10, 'thing']] } },
+    { label: 'show my list', opcode: 'data_showlist' },
+    { label: 'hide my list', opcode: 'data_hidelist' },
   ],
   'My Blocks': [
     { label: 'Make a Block', opcode: 'procedures_definition' },
+  ],
+  Pen: [
+    { label: 'erase all', opcode: 'pen_clear' },
+    { label: 'stamp', opcode: 'pen_stamp' },
+    { label: 'pen down', opcode: 'pen_penDown' },
+    { label: 'pen up', opcode: 'pen_penUp' },
+    { label: 'set pen color to [#0000ff]', opcode: 'pen_setPenColorToColor', inputs: { COLOR: [1, [9, '#0000ff']] } },
+    { label: 'change pen {color} by [10]', opcode: 'pen_changePenColorParamBy', inputs: { VALUE: [1, [4, '10']] }, fields: { COLOR_PARAM: ['color', null] } },
+    { label: 'set pen {color} to [50]', opcode: 'pen_setPenColorParamTo', inputs: { VALUE: [1, [4, '50']] }, fields: { COLOR_PARAM: ['color', null] } },
+    { label: 'change pen size by [1]', opcode: 'pen_changePenSizeBy', inputs: { SIZE: [1, [4, '1']] } },
+    { label: 'set pen size to [1]', opcode: 'pen_setPenSizeTo', inputs: { SIZE: [1, [4, '1']] } },
+  ],
+  Music: [
+    { label: 'play drum {1} for [0.25] beats', opcode: 'music_playDrumForBeats', inputs: { BEATS: [1, [4, '0.25']] }, fields: { DRUM: ['1', null] } },
+    { label: 'rest for [0.25] beats', opcode: 'music_restForBeats', inputs: { BEATS: [1, [4, '0.25']] } },
+    { label: 'play note [60] for [0.25] beats', opcode: 'music_playNoteForBeats', inputs: { NOTE: [1, [4, '60']], BEATS: [1, [4, '0.25']] } },
+    { label: 'set instrument to {1}', opcode: 'music_setInstrument', fields: { INSTRUMENT: ['1', null] } },
+    { label: 'set tempo to [60]', opcode: 'music_setTempo', inputs: { TEMPO: [1, [4, '60']] } },
+    { label: 'change tempo by [20]', opcode: 'music_changeTempo', inputs: { TEMPO: [1, [4, '20']] } },
+    { label: 'tempo', opcode: 'music_getTempo' },
   ],
 };
 
@@ -269,6 +389,8 @@ const categoryColors: Record<string, string> = {
   Operators: '#59c059',
   Variables: '#ff8c1a',
   'My Blocks': '#ff6680',
+  Pen: '#0fbd8c',
+  Music: '#d65cd6',
 };
 
 const categoryRail = [
@@ -281,13 +403,17 @@ const categoryRail = [
   { name: 'Operators', color: '#59c059' },
   { name: 'Variables', color: '#ff8c1a' },
   { name: 'My Blocks', color: '#ff6680' },
+  { name: 'Pen', color: '#0fbd8c' },
+  { name: 'Music', color: '#d65cd6' },
 ];
 
 const generateId = () => Math.random().toString(36).slice(2, 10);
 const formatJson = (value: unknown) => JSON.stringify(value, null, 2);
 
-const DEFAULT_STAGE_COSTUME_FILE = 'cdx-stage-default.svg';
-const DEFAULT_SPRITE_COSTUME_FILE = 'cdx-sprite-default.svg';
+const DEFAULT_STAGE_ASSET_ID = 'cd21514d0531fdffb22204e0ec5ed84a';
+const DEFAULT_SPRITE_ASSET_ID = 'bcf454acf82e4504149f7ffe07081dbc';
+const DEFAULT_STAGE_COSTUME_FILE = `${DEFAULT_STAGE_ASSET_ID}.svg`;
+const DEFAULT_SPRITE_COSTUME_FILE = `${DEFAULT_SPRITE_ASSET_ID}.svg`;
 const DEFAULT_STAGE_COSTUME_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 360"><defs><linearGradient id="bg" x1="0" x2="0" y1="0" y2="1"><stop stop-color="#87ceeb"/><stop offset="1" stop-color="#dff3ff"/></linearGradient></defs><rect width="480" height="360" fill="url(#bg)"/><circle cx="410" cy="70" r="40" fill="#ffd35a"/><rect y="260" width="480" height="100" fill="#95d08f"/></svg>`;
 const DEFAULT_SPRITE_COSTUME_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><ellipse cx="48" cy="76" rx="28" ry="14" fill="#d18f3b"/><circle cx="36" cy="40" r="20" fill="#f8a64a"/><circle cx="60" cy="40" r="20" fill="#f8a64a"/><circle cx="48" cy="58" r="20" fill="#f8a64a"/><circle cx="42" cy="56" r="3" fill="#222"/><circle cx="54" cy="56" r="3" fill="#222"/></svg>`;
 
@@ -296,7 +422,7 @@ const utf8ToBase64 = (value: string) => btoa(unescape(encodeURIComponent(value))
 const getDefaultCostumeForTarget = (target: ScratchTarget) => (target.isStage
   ? {
       name: 'backdrop1',
-      assetId: 'cdx-stage-default',
+      assetId: DEFAULT_STAGE_ASSET_ID,
       md5ext: DEFAULT_STAGE_COSTUME_FILE,
       dataFormat: 'svg',
       rotationCenterX: 240,
@@ -304,7 +430,7 @@ const getDefaultCostumeForTarget = (target: ScratchTarget) => (target.isStage
     }
   : {
       name: 'costume1',
-      assetId: 'cdx-sprite-default',
+      assetId: DEFAULT_SPRITE_ASSET_ID,
       md5ext: DEFAULT_SPRITE_COSTUME_FILE,
       dataFormat: 'svg',
       rotationCenterX: 48,
@@ -317,8 +443,41 @@ const normalizeProjectForVm = (project: ScratchProject): ScratchProject => ({
     const costumes = target.costumes && target.costumes.length > 0
       ? target.costumes
       : [getDefaultCostumeForTarget(target)];
+
+    // Ensure every block has an `id` property matching its dictionary key.
+    // Real .sb3 files store blocks as { [id]: { opcode, ... } } without `id` inside.
+    const blocks: Record<string, ScratchBlockNode> = {};
+    if (target.blocks) {
+      for (const [key, block] of Object.entries(target.blocks)) {
+        blocks[key] = { ...block, id: block.id || key };
+      }
+    }
+
+    // Compute positions for blocks that lack x/y by walking `next` chains
+    // from top-level blocks. In .sb3 files only top-level blocks have x/y.
+    const BLOCK_STEP = 48;
+    for (const [, block] of Object.entries(blocks)) {
+      if (!block.topLevel || block.shadow) continue;
+      let cursor = block.next;
+      let depth = 1;
+      while (cursor && blocks[cursor]) {
+        const child = blocks[cursor];
+        if (child.x === undefined || child.y === undefined) {
+          blocks[cursor] = {
+            ...child,
+            x: block.x ?? 40,
+            y: (block.y ?? 30) + depth * BLOCK_STEP,
+          };
+        }
+        cursor = child.next ?? null;
+        depth++;
+        if (depth > 200) break; // safety
+      }
+    }
+
     return {
       ...target,
+      blocks,
       costumes,
       currentCostume: typeof target.currentCostume === 'number'
         ? Math.min(Math.max(0, target.currentCostume), Math.max(0, costumes.length - 1))
@@ -368,8 +527,8 @@ const ensureArchive = (archive: ScratchArchive | null): ScratchArchive => {
 };
 
 const makeNumberInput = (value: string) => [1, [4, value]];
-const isEventBlock = (opcode: string) => opcode.startsWith('event_');
-const getBlockColor = (opcode: string) => (opcode.startsWith('motion_') ? '#4c97ff'
+const isEventBlock = (opcode: string) => opcode?.startsWith('event_');
+const getBlockColor = (opcode: string) => (!opcode ? '#4c97ff' : opcode.startsWith('motion_') ? '#4c97ff'
   : opcode.startsWith('looks_') ? '#9966ff'
     : opcode.startsWith('sound_') ? '#cf63cf'
       : opcode.startsWith('event_') ? '#ffbf00'
@@ -378,7 +537,15 @@ const getBlockColor = (opcode: string) => (opcode.startsWith('motion_') ? '#4c97
             : opcode.startsWith('operator_') ? '#59c059'
               : opcode.startsWith('data_') ? '#ff8c1a'
                 : opcode.startsWith('procedures_') ? '#ff6680'
-                  : '#4c97ff');
+                  : opcode.startsWith('pen_') ? '#0fbd8c'
+                    : opcode.startsWith('music_') ? '#d65cd6'
+                      : '#4c97ff');
+
+const getExtensionId = (opcode: string): string | null => {
+  if (opcode.startsWith('pen_')) return 'pen';
+  if (opcode.startsWith('music_')) return 'music';
+  return null;
+};
 
 const extensionOf = (name: string) => {
   const idx = name.lastIndexOf('.');
@@ -409,38 +576,61 @@ const createVmCompatibleBlockShape = (
   const nextFields = { ...(blockDef.fields || {}) };
   const extraBlocks: Record<string, ScratchBlockNode> = {};
 
-  if (blockDef.opcode === 'motion_goto' || blockDef.opcode === 'motion_glideto') {
+  const createShadow = (inputKey: string, opcode: string, fieldKey: string, defaultValue: string) => {
     const menuId = generateId();
-    const toValue = getFieldOption(blockDef.fields, 'TO', '_random_');
     extraBlocks[menuId] = {
       id: menuId,
-      opcode: 'motion_goto_menu',
+      opcode,
       parent: blockId,
       topLevel: false,
       shadow: true,
-      fields: { TO: [toValue, null] },
+      fields: { [fieldKey]: [defaultValue, null] },
       inputs: {},
       next: null,
     };
-    nextInputs.TO = [1, menuId];
-    delete nextFields.TO;
+    nextInputs[inputKey] = [1, menuId];
+    delete nextFields[fieldKey];
+  };
+
+  const op = blockDef.opcode;
+
+  // Motion menus
+  if (op === 'motion_goto') createShadow('TO', 'motion_goto_menu', 'TO', getFieldOption(blockDef.fields, 'TO', '_random_'));
+  if (op === 'motion_glideto') createShadow('TO', 'motion_glideto_menu', 'TO', getFieldOption(blockDef.fields, 'TO', '_random_'));
+  if (op === 'motion_pointtowards') createShadow('TOWARDS', 'motion_pointtowards_menu', 'TOWARDS', getFieldOption(blockDef.fields, 'TOWARDS', '_mouse_'));
+
+  // Looks menus
+  if (op === 'looks_switchcostumeto') createShadow('COSTUME', 'looks_costume', 'COSTUME', getFieldOption(blockDef.fields, 'COSTUME', 'costume1'));
+  if (op === 'looks_switchbackdropto') createShadow('BACKDROP', 'looks_backdrops', 'BACKDROP', getFieldOption(blockDef.fields, 'BACKDROP', 'backdrop1'));
+
+  // Sound menus
+  if (op === 'sound_playuntildone' || op === 'sound_play') createShadow('SOUND_MENU', 'sound_sounds_menu', 'SOUND_MENU', getFieldOption(blockDef.fields, 'SOUND_MENU', 'pop'));
+
+  // Control menus
+  if (op === 'control_create_clone_of') createShadow('CLONE_OPTION', 'control_create_clone_of_menu', 'CLONE_OPTION', getFieldOption(blockDef.fields, 'CLONE_OPTION', '_myself_'));
+
+  // Sensing menus
+  if (op === 'sensing_touchingobject') createShadow('TOUCHINGOBJECTMENU', 'sensing_touchingobjectmenu', 'TOUCHINGOBJECTMENU', getFieldOption(blockDef.fields, 'TOUCHINGOBJECTMENU', '_mouse_'));
+  if (op === 'sensing_distanceto') createShadow('DISTANCETOMENU', 'sensing_distancetomenu', 'DISTANCETOMENU', getFieldOption(blockDef.fields, 'DISTANCETOMENU', '_mouse_'));
+  if (op === 'sensing_keypressed') createShadow('KEY_OPTION', 'sensing_keyoptions', 'KEY_OPTION', getFieldOption(blockDef.fields, 'KEY_OPTION', 'space'));
+  if (op === 'sensing_of') createShadow('OBJECT', 'sensing_of_object_menu', 'OBJECT', getFieldOption(blockDef.fields, 'OBJECT', '_stage_'));
+
+  // Sensing color inputs
+  if (op === 'sensing_touchingcolor' && !nextInputs.COLOR) {
+    nextInputs.COLOR = [1, [9, '#0000ff']];
+  }
+  if (op === 'sensing_coloristouchingcolor') {
+    if (!nextInputs.COLOR) nextInputs.COLOR = [1, [9, '#0000ff']];
+    if (!nextInputs.COLOR2) nextInputs.COLOR2 = [1, [9, '#ff0000']];
   }
 
-  if (blockDef.opcode === 'motion_pointtowards') {
-    const menuId = generateId();
-    const towardValue = getFieldOption(blockDef.fields, 'TOWARDS', '_mouse_');
-    extraBlocks[menuId] = {
-      id: menuId,
-      opcode: 'motion_pointtowards_menu',
-      parent: blockId,
-      topLevel: false,
-      shadow: true,
-      fields: { TOWARDS: [towardValue, null] },
-      inputs: {},
-      next: null,
-    };
-    nextInputs.TOWARDS = [1, menuId];
-    delete nextFields.TOWARDS;
+  // Music extension menus
+  if (op === 'music_setInstrument') createShadow('INSTRUMENT', 'music_menu_INSTRUMENT', 'INSTRUMENT', getFieldOption(blockDef.fields, 'INSTRUMENT', '1'));
+  if (op === 'music_playDrumForBeats') createShadow('DRUM', 'music_menu_DRUM', 'DRUM', getFieldOption(blockDef.fields, 'DRUM', '1'));
+
+  // Pen color param menus
+  if (op === 'pen_changePenColorParamBy' || op === 'pen_setPenColorParamTo') {
+    createShadow('COLOR_PARAM', 'pen_menu_colorParam', 'colorParam', getFieldOption(blockDef.fields, 'COLOR_PARAM', 'color'));
   }
 
   return {
@@ -512,42 +702,348 @@ const ensureDataRefForTarget = (target: ScratchTarget, blockDef: ScratchBlockDef
   return { target: nextTarget, fields: nextFields };
 };
 
+/** Variables category flyout — matches real Scratch editor layout */
+const VariablesFlyout = ({
+  variables,
+  lists,
+  blocks,
+  color,
+  onMakeVariable,
+  onMakeList,
+  onAddBlock,
+  onDeleteVariable,
+  onDeleteList,
+  onRenameVariable,
+  onRenameList,
+}: {
+  variables: [string, [string, ScratchInputPrimitive]][];
+  lists: [string, [string, ScratchInputPrimitive[]]][];
+  blocks: ScratchBlockDef[];
+  color: string;
+  onMakeVariable: () => void;
+  onMakeList: () => void;
+  onAddBlock: (blockDef: ScratchBlockDef) => void;
+  onDeleteVariable: (id: string) => void;
+  onDeleteList: (id: string) => void;
+  onRenameVariable: (id: string, oldName: string) => void;
+  onRenameList: (id: string, oldName: string) => void;
+}) => {
+  const [contextMenu, setContextMenu] = useState<{
+    x: number; y: number; type: 'variable' | 'list'; id: string; name: string;
+    allNames: string[];
+  } | null>(null);
+
+  // Track which variable/list is selected for block insertion
+  const [selectedVarId, setSelectedVarId] = useState<string | null>(null);
+  const [selectedListId, setSelectedListId] = useState<string | null>(null);
+
+  // Auto-select first variable/list if none selected
+  const activeVarId = selectedVarId && variables.some(([id]) => id === selectedVarId) ? selectedVarId : variables[0]?.[0] || null;
+  const activeListId = selectedListId && lists.some(([id]) => id === selectedListId) ? selectedListId : lists[0]?.[0] || null;
+
+  const activeVarName = variables.find(([id]) => id === activeVarId)?.[1]?.[0] || '';
+  const activeListName = lists.find(([id]) => id === activeListId)?.[1]?.[0] || '';
+
+  const varBlocks = blocks.filter((b) => !b.opcode.includes('list') && !b.opcode.includes('List'));
+  const listBlocks = blocks.filter((b) => b.opcode.includes('list') || b.opcode.includes('List'));
+
+  const varNames = variables.map(([, [name]]) => name);
+  const listNames = lists.map(([, [name]]) => name);
+
+  // Replace "my variable" in block labels with the selected variable name
+  const resolveVarLabel = (label: string) => {
+    if (activeVarName) return label.replace('my variable', activeVarName);
+    return label;
+  };
+  const resolveListLabel = (label: string) => {
+    if (activeListName) return label.replace('my list', activeListName);
+    return label;
+  };
+
+  // Wrap onAddBlock to inject the selected variable/list into the block fields
+  const handleAddVarBlock = (blockDef: ScratchBlockDef) => {
+    if (activeVarId && activeVarName) {
+      const patched = { ...blockDef, fields: { ...blockDef.fields, VARIABLE: [activeVarName, activeVarId] } };
+      onAddBlock(patched);
+    } else {
+      onAddBlock(blockDef);
+    }
+  };
+  const handleAddListBlock = (blockDef: ScratchBlockDef) => {
+    if (activeListId && activeListName) {
+      const patched = { ...blockDef, fields: { ...blockDef.fields, LIST: [activeListName, activeListId] } };
+      onAddBlock(patched);
+    } else {
+      onAddBlock(blockDef);
+    }
+  };
+
+  return (
+    <div className="space-y-2" onClick={() => setContextMenu(null)}>
+      {/* Make a Variable button */}
+      <button
+        onClick={onMakeVariable}
+        className="w-full py-2 rounded-lg text-[14px] font-semibold text-[#575e75] border-2 border-[#d0d0d0] bg-white hover:bg-[#f8f8f8] transition-colors"
+      >
+        Make a Variable
+      </button>
+
+      {/* Variable reporters */}
+      {variables.length > 0 && (
+        <div className="space-y-1.5 py-1">
+          {variables.map(([id, [name]]) => (
+            <div key={id} className="flex items-center gap-2">
+              <input type="checkbox" defaultChecked className="w-4 h-4 rounded accent-[#ff8c1a]" />
+              <div
+                className="cursor-pointer"
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setContextMenu({ x: e.clientX, y: e.clientY, type: 'variable', id, name, allNames: varNames });
+                }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setContextMenu((prev) =>
+                    prev?.id === id ? null : { x: e.clientX, y: e.clientY, type: 'variable', id, name, allNames: varNames }
+                  );
+                }}
+              >
+                <ScratchBlockShape label={name} color={color} shape="reporter" width={Math.max(80, name.length * 8 + 30)} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Variable selector + blocks */}
+      {variables.length > 0 && (
+        <div className="space-y-1.5">
+          {variables.length > 1 && (
+            <select
+              value={activeVarId || ''}
+              onChange={(e) => setSelectedVarId(e.target.value)}
+              className="w-full rounded-lg border-2 border-[#ff8c1a] bg-white px-2 py-1.5 text-[13px] text-[#575e75] font-semibold outline-none cursor-pointer"
+            >
+              {variables.map(([id, [name]]) => (
+                <option key={id} value={id}>{name}</option>
+              ))}
+            </select>
+          )}
+          {varBlocks.map((blockDef) => {
+            const shape = getBlockShape(blockDef.opcode);
+            return (
+              <div
+                key={blockDef.label}
+                draggable
+                onDragStart={(e) => {
+                  const patched = activeVarId && activeVarName
+                    ? { ...blockDef, fields: { ...blockDef.fields, VARIABLE: [activeVarName, activeVarId] } }
+                    : blockDef;
+                  e.dataTransfer.setData('application/scratch-block', JSON.stringify(patched));
+                  e.dataTransfer.effectAllowed = 'copy';
+                }}
+                onClick={() => handleAddVarBlock(blockDef)}
+                className="cursor-grab active:cursor-grabbing hover:brightness-110 transition-all"
+              >
+                <ScratchBlockShape label={resolveVarLabel(blockDef.label)} color={color} shape={shape} />
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Separator */}
+      <div className="border-t border-[#e0e0e0] my-2" />
+
+      {/* Make a List button */}
+      <button
+        onClick={onMakeList}
+        className="w-full py-2 rounded-lg text-[14px] font-semibold text-[#575e75] border-2 border-[#d0d0d0] bg-white hover:bg-[#f8f8f8] transition-colors"
+      >
+        Make a List
+      </button>
+
+      {/* List reporters */}
+      {lists.length > 0 && (
+        <div className="space-y-1.5 py-1">
+          {lists.map(([id, [name]]) => (
+            <div key={id} className="flex items-center gap-2">
+              <input type="checkbox" defaultChecked className="w-4 h-4 rounded accent-[#e6832a]" />
+              <div
+                className="cursor-pointer"
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setContextMenu({ x: e.clientX, y: e.clientY, type: 'list', id, name, allNames: listNames });
+                }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setContextMenu((prev) =>
+                    prev?.id === id ? null : { x: e.clientX, y: e.clientY, type: 'list', id, name, allNames: listNames }
+                  );
+                }}
+              >
+                <ScratchBlockShape label={name} color="#e6832a" shape="reporter" width={Math.max(80, name.length * 8 + 30)} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* List selector + blocks */}
+      {lists.length > 0 && (
+        <div className="space-y-1.5">
+          {lists.length > 1 && (
+            <select
+              value={activeListId || ''}
+              onChange={(e) => setSelectedListId(e.target.value)}
+              className="w-full rounded-lg border-2 border-[#e6832a] bg-white px-2 py-1.5 text-[13px] text-[#575e75] font-semibold outline-none cursor-pointer"
+            >
+              {lists.map(([id, [name]]) => (
+                <option key={id} value={id}>{name}</option>
+              ))}
+            </select>
+          )}
+          {listBlocks.map((blockDef) => {
+            const shape = getBlockShape(blockDef.opcode);
+            return (
+              <div
+                key={blockDef.label}
+                draggable
+                onDragStart={(e) => {
+                  const patched = activeListId && activeListName
+                    ? { ...blockDef, fields: { ...blockDef.fields, LIST: [activeListName, activeListId] } }
+                    : blockDef;
+                  e.dataTransfer.setData('application/scratch-block', JSON.stringify(patched));
+                  e.dataTransfer.effectAllowed = 'copy';
+                }}
+                onClick={() => handleAddListBlock(blockDef)}
+                className="cursor-grab active:cursor-grabbing hover:brightness-110 transition-all"
+              >
+                <ScratchBlockShape label={resolveListLabel(blockDef.label)} color="#e6832a" shape={shape} />
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Context menu for variable/list reporters */}
+      {contextMenu && (
+        <div
+          className="fixed z-[100] rounded-lg shadow-xl border border-[#d0d0d0] bg-[#ffd948] py-2 min-w-[200px]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* List all items of this type with a checkmark on the selected one */}
+          {contextMenu.allNames.map((n) => (
+            <div
+              key={n}
+              className="px-4 py-1.5 text-[13px] font-bold text-white hover:bg-[#eec530] cursor-pointer flex items-center gap-2"
+            >
+              {n === contextMenu.name && <span>✓</span>}
+              <span className={n === contextMenu.name ? '' : 'ml-5'}>{n}</span>
+            </div>
+          ))}
+          <div className="border-t border-[#eec530] my-1" />
+          <button
+            onClick={() => {
+              contextMenu.type === 'variable'
+                ? onRenameVariable(contextMenu.id, contextMenu.name)
+                : onRenameList(contextMenu.id, contextMenu.name);
+              setContextMenu(null);
+            }}
+            className="w-full text-left px-4 py-1.5 text-[13px] font-bold text-white hover:bg-[#eec530]"
+          >
+            Rename {contextMenu.type}
+          </button>
+          <button
+            onClick={() => {
+              contextMenu.type === 'variable'
+                ? onDeleteVariable(contextMenu.id)
+                : onDeleteList(contextMenu.id);
+              setContextMenu(null);
+            }}
+            className="w-full text-left px-4 py-1.5 text-[13px] font-bold text-white hover:bg-[#eec530]"
+          >
+            Delete the "{contextMenu.name}" {contextMenu.type}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
 export const ScratchPanel = ({ archive, onArchiveChange, onProjectJsonUpdate, isRunning, onRun, onStop }: ScratchPanelProps) => {
   const [activeEditorTab, setActiveEditorTab] = useState<'code' | 'costumes' | 'sounds'>('code');
   const [activeCategory, setActiveCategory] = useState('Motion');
   const [selectedTargetIndex, setSelectedTargetIndex] = useState(1);
   const [projectJsonDraft, setProjectJsonDraft] = useState('');
   const [jsonError, setJsonError] = useState<string | null>(null);
-  const [stagePreview, setStagePreview] = useState({ x: 180, y: 110, direction: 90, visible: true });
+  const [stagePreview, setStagePreview] = useState({ x: 0, y: 0, direction: 90, visible: true, size: 100 });
   const [spriteVisible, setSpriteVisible] = useState(true);
   const [workspaceZoom, setWorkspaceZoom] = useState(1);
   const [vmReady, setVmReady] = useState(false);
+
+  // Pointer-based drag state for smooth block dragging
+  const dragRef = useRef<{
+    blockId: string;
+    startX: number;
+    startY: number;
+    offsetX: number;
+    offsetY: number;
+    originalBlock: ScratchBlockNode;
+    detached: boolean;
+  } | null>(null);
+  const [dragBlockId, setDragBlockId] = useState<string | null>(null);
+  const [snapPreview, setSnapPreview] = useState<{ id: string; type: 'next' | 'substack'; x: number; y: number } | null>(null);
+  const workspaceRef = useRef<HTMLDivElement>(null);
   const [vmError, setVmError] = useState<string | null>(null);
+  const [dataPrompt, setDataPrompt] = useState<{ type: 'variable' | 'list'; name: string } | null>(null);
+  const [libraryOpen, setLibraryOpen] = useState<LibraryMode | null>(null);
+  const [renameTarget, setRenameTarget] = useState<{ type: 'variable' | 'list'; id: string; oldName: string } | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const costumeInputRef = useRef<HTMLInputElement>(null);
   const soundInputRef = useRef<HTMLInputElement>(null);
+  const backdropInputRef = useRef<HTMLInputElement>(null);
   const vmRef = useRef<ScratchVmLike | null>(null);
+  const rendererRef = useRef<{ draw(): void; destroy(): void } | null>(null);
   const audioPreviewRef = useRef<HTMLAudioElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const rafRef = useRef<number>(0);
+  const archiveRef = useRef<ScratchArchive | null>(archive);
+  const storageReadyRef = useRef(false);
+  const projectLoadedRef = useRef(false);
+
+  // Keep archiveRef in sync for the storage adapter closure
+  useEffect(() => {
+    archiveRef.current = archive;
+  }, [archive]);
 
   const project = useMemo(() => safeParseProject(archive), [archive]);
   const selectedTarget = project.targets[Math.max(0, Math.min(project.targets.length - 1, selectedTargetIndex))];
   const selectedBlocks = Object.values(selectedTarget?.blocks || {});
   const spriteTargets = project.targets.filter((target) => !target.isStage);
+  const stageTarget = project.targets.find((t) => t.isStage);
+  const stageBackdrops = stageTarget?.costumes || [];
+  const stageCurrentBackdrop = Number(stageTarget?.currentCostume || 0);
   const blockLabels = useMemo(() => {
-    const map: Record<string, string> = {};
+   const map: Record<string, string> = {};
     Object.values(categoryBlocks).forEach((defs) => defs.forEach((d) => { map[d.opcode] = d.label; }));
     return map;
   }, []);
+
+  const imgMime = (fmt: string | undefined) => {
+    const f = fmt || 'png';
+    return f === 'svg' ? 'image/svg+xml' : `image/${f}`;
+  };
 
   const selectedCostumes = selectedTarget?.costumes || [];
   const selectedSounds = selectedTarget?.sounds || [];
   const currentCostumeIndex = Number(selectedTarget?.currentCostume || 0);
   const activeCostume = selectedCostumes[currentCostumeIndex] || selectedCostumes[0];
   const stageCostumeSrc = activeCostume && archive?.files?.[activeCostume.md5ext]
-    ? `data:image/${activeCostume.dataFormat || 'png'};base64,${archive.files[activeCostume.md5ext]}`
+    ? `data:${imgMime(activeCostume.dataFormat)};base64,${archive.files[activeCostume.md5ext]}`
     : null;
 
-  const syncFromVm = () => {
+  const syncFromVm = useCallback(() => {
     const vm = vmRef.current;
     if (!vm || !vm.runtime) return;
     const preferredName = selectedTarget?.name;
@@ -561,65 +1057,249 @@ export const ScratchPanel = ({ archive, onArchiveChange, onProjectJsonUpdate, is
     const visible = Boolean(runtimeTarget.visible);
 
     setStagePreview({
-      x: Math.max(10, Math.min(360, 180 + x * 0.7)),
-      y: Math.max(10, Math.min(240, 110 - y * 0.6)),
+      x,
+      y,
       direction,
       visible,
+      size: 100,
     });
     setSpriteVisible(visible);
-  };
+  }, [selectedTarget?.name]);
 
-const loadVmFromArchive = async (nextArchive: ScratchArchive) => {
-    if (!vmRef.current) return;
+  const loadVmFromArchive = useCallback(async (nextArchive: ScratchArchive) => {
+    if (!vmRef.current || !storageReadyRef.current) return;
     try {
       const normalizedArchive = ensureArchive(nextArchive);
+      console.log('[Scratch] loadVmFromArchive — files:', Object.keys(normalizedArchive.files).length, 'fileNames:', normalizedArchive.fileNames);
       const data = await exportSb3(normalizedArchive);
       const ab = data.buffer instanceof ArrayBuffer
         ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
         : data.slice().buffer;
+      console.log('[Scratch] Loading project into VM, size:', ab.byteLength);
       await vmRef.current.loadProject(ab);
+      projectLoadedRef.current = true;
+      console.log('[Scratch] Project loaded successfully, targets:', vmRef.current.runtime?.targets?.length);
       setVmError(null);
       syncFromVm();
     } catch (error) {
-      // Non-critical: VM may not support all project features
+      projectLoadedRef.current = false;
       console.warn('scratch-vm loadProject warning:', error);
-      setVmError(null);
+      setVmError(error instanceof Error ? error.message : 'Failed to load Scratch project');
     }
-  };
+  }, [syncFromVm]);
 
+  // Initialize VM with renderer, storage, and audio engine (dynamic imports)
   useEffect(() => {
-    try {
-      const VmCtor = VirtualMachine as unknown as { new (): ScratchVmLike };
-      const vm = new VmCtor();
-      vm.start();
-      vmRef.current = vm;
-      setVmReady(true);
-      setVmError(null);
-    } catch (error) {
-      setVmError(error instanceof Error ? error.message : 'Failed to initialize scratch-vm.');
-    }
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    let cancelled = false;
+    let useWebGLRenderer = false;
 
-    return () => {
+    // Create a separate offscreen canvas for 2D fallback drawing
+    // (scratch-render claims the main canvas as WebGL, so getContext('2d') would return null)
+    const fallbackCanvas = document.createElement('canvas');
+    fallbackCanvas.width = canvas.width;
+    fallbackCanvas.height = canvas.height;
+
+    const initVm = async () => {
       try {
-        vmRef.current?.stopAll();
-      } catch {
-        // noop
+        const VmCtor = VirtualMachine as unknown as { new (): ScratchVmLike };
+        const vm = new VmCtor();
+
+        projectLoadedRef.current = false;
+
+        // Attach storage first; renderer depends on successful project asset resolution
+        try {
+          storageReadyRef.current = false;
+          const storageMod = await import('scratch-storage');
+          const resolveStorageCtor = (mod: any): ((new () => any) | null) => {
+            const candidates = [
+              mod?.default?.default,
+              mod?.default,
+              mod?.ScratchStorage,
+              mod?.default?.ScratchStorage,
+              mod,
+            ];
+            for (const candidate of candidates) {
+              if (typeof candidate === 'function') return candidate as new () => any;
+            }
+            return null;
+          };
+
+          const StorageCtor = resolveStorageCtor(storageMod);
+          console.log('[Scratch] scratch-storage exports:', Object.keys(storageMod || {}));
+
+          if (!StorageCtor) {
+            throw new Error('scratch-storage constructor not found');
+          }
+
+          const storage = new StorageCtor();
+
+          const AssetType = storage.AssetType;
+          storage.addWebStore(
+            [AssetType.ImageVector, AssetType.ImageBitmap, AssetType.Sound],
+            (asset: { assetId: string; dataFormat: string }) => {
+              const key = `${asset.assetId}.${asset.dataFormat}`;
+              const b64 = archiveRef.current?.files?.[key];
+              if (b64) {
+                return `data:application/octet-stream;base64,${b64}`;
+              }
+              return '';
+            }
+          );
+
+          vm.attachStorage(storage);
+          storageReadyRef.current = true;
+          console.log('[Scratch] scratch-storage attached successfully');
+        } catch (e) {
+          storageReadyRef.current = false;
+          setVmError('Storage initialization failed');
+          console.warn('scratch-storage not available:', e);
+        }
+
+        // Keep 2D fallback renderer as primary path for compatibility in this environment
+        useWebGLRenderer = false;
+
+        // Dynamically import and attach audio engine
+        try {
+          const audioMod = await import('scratch-audio');
+          const AudioCtor = audioMod.default || audioMod;
+          if (typeof AudioCtor === 'function') {
+            const audioEngine = new AudioCtor();
+            vm.attachAudioEngine(audioEngine);
+          }
+        } catch (e) {
+          console.warn('scratch-audio not available:', e);
+        }
+
+        if (cancelled) return;
+
+        vm.start();
+        vmRef.current = vm;
+
+        // Load built-in extensions (pen, music)
+        try {
+          const em = (vm as any).extensionManager;
+          if (em?.loadExtensionIdSync) {
+            em.loadExtensionIdSync('pen');
+            em.loadExtensionIdSync('music');
+          } else if (em?.loadExtensionURL) {
+            em.loadExtensionURL('pen').catch(() => {});
+            em.loadExtensionURL('music').catch(() => {});
+          }
+          console.log('[Scratch] Extensions loaded');
+        } catch (e) {
+          console.warn('[Scratch] Extension loading:', e);
+        }
+
+        // Handle "ask and wait" blocks — VM emits QUESTION, waits for ANSWER
+        const rt = vm.runtime as any;
+        rt?.on?.('QUESTION', (question: string) => {
+          const answer = window.prompt(question || 'What is your name?') || '';
+          rt?.emit?.('ANSWER', answer);
+        });
+
+        setVmReady(true);
+        if (!storageReadyRef.current) {
+          setVmError('Storage unavailable; running in 2D fallback mode.');
+        }
+        console.log('[Scratch] VM started, useWebGLRenderer:', useWebGLRenderer);
+
+        // Start draw loop
+        let rendererProducedOutput = false;
+        let frameCount = 0;
+        const drawStep = () => {
+          frameCount++;
+          rendererProducedOutput = false;
+          if (useWebGLRenderer && rendererRef.current && projectLoadedRef.current) {
+            try {
+              rendererRef.current.draw();
+              rendererProducedOutput = true;
+            } catch (e) {
+              if (frameCount < 5) console.warn('[Scratch] renderer.draw() error:', e);
+              rendererProducedOutput = false;
+            }
+          }
+
+          // If WebGL renderer isn't working, use 2D fallback on a separate canvas
+          // then copy to the main canvas
+          if (!rendererProducedOutput) {
+            const ctx2d = fallbackCanvas.getContext('2d');
+            if (ctx2d) {
+              drawFallbackStage(ctx2d, fallbackCanvas.width, fallbackCanvas.height, archiveRef.current, vmRef.current);
+              // Copy fallback to the visible canvas (which may not have a 2D context)
+              const mainCtx = canvas.getContext('2d');
+              if (mainCtx) {
+                mainCtx.drawImage(fallbackCanvas, 0, 0);
+              }
+            }
+          }
+
+          syncFromVm();
+          rafRef.current = requestAnimationFrame(drawStep);
+        };
+        rafRef.current = requestAnimationFrame(drawStep);
+      } catch (error) {
+        console.error('[Scratch] VM init failed:', error);
+        if (!cancelled) {
+          setVmError(error instanceof Error ? error.message : 'Failed to initialize scratch-vm.');
+        }
       }
     };
+
+    initVm();
+
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(rafRef.current);
+      try {
+        vmRef.current?.stopAll();
+      } catch { /* noop */ }
+      try {
+        rendererRef.current?.destroy();
+      } catch { /* noop */ }
+      rendererRef.current = null;
+      vmRef.current = null;
+      projectLoadedRef.current = false;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     if (!archive || !vmReady) return;
     loadVmFromArchive(archive);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [archive, vmReady]);
+  }, [archive, vmReady, loadVmFromArchive]);
 
+  // Sync with parent isRunning state (e.g. header Run/Stop button)
+  const prevIsRunning = useRef(isRunning);
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      syncFromVm();
-    }, 120);
-    return () => window.clearInterval(timer);
-  });
+    if (!vmReady || !vmRef.current) {
+      prevIsRunning.current = isRunning;
+      return;
+    }
+    if (isRunning && !prevIsRunning.current) {
+      // Parent triggered run (header button) — start VM
+      try {
+        if (!projectLoadedRef.current) {
+          setVmError('Project not loaded yet. Please press Run again.');
+          onStop();
+          return;
+        }
+        vmRef.current.greenFlag();
+        setTimeout(() => syncFromVm(), 120);
+      } catch (error) {
+        setVmError(error instanceof Error ? error.message : 'VM runtime error.');
+        onStop();
+      }
+    } else if (!isRunning && prevIsRunning.current) {
+      // Parent triggered stop — stop VM
+      try {
+        vmRef.current.stopAll();
+        syncFromVm();
+      } catch { /* noop */ }
+    }
+    prevIsRunning.current = isRunning;
+  }, [isRunning, vmReady, syncFromVm, onStop]);
 
   const updateProject = (updater: (current: ScratchProject) => ScratchProject) => {
     const nextProject = updater(project);
@@ -698,6 +1378,41 @@ const loadVmFromArchive = async (nextArchive: ScratchArchive) => {
     );
   };
 
+  const addBackdrop = async (file: File) => {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const assetId = `${Date.now().toString(16)}${Math.random().toString(16).slice(2, 8)}`;
+    const dataFormat = extensionOf(file.name) || 'png';
+    const md5ext = `${assetId}.${dataFormat}`;
+    const base64 = bytesToBase64(bytes);
+
+    await updateArchiveWithProject(
+      (current) => ({
+        ...current,
+        targets: current.targets.map((target) => {
+          if (!target.isStage) return target;
+          const costumes = target.costumes || [];
+          return {
+            ...target,
+            costumes: [...costumes, { name: file.name.replace(/\.[^/.]+$/, ''), assetId, md5ext, dataFormat, rotationCenterX: 240, rotationCenterY: 180 }],
+            currentCostume: costumes.length,
+          };
+        }),
+      }),
+      (currentArchive) => ({
+        ...currentArchive,
+        files: { ...currentArchive.files, [md5ext]: base64 },
+        fileNames: currentArchive.fileNames.includes(md5ext) ? currentArchive.fileNames : [...currentArchive.fileNames, md5ext],
+      }),
+    );
+  };
+
+  const setStageBackdrop = (index: number) => {
+    updateProject((current) => ({
+      ...current,
+      targets: current.targets.map((target) => target.isStage ? { ...target, currentCostume: index } : target),
+    }));
+  };
+
   const addSound = async (file: File) => {
     const bytes = new Uint8Array(await file.arrayBuffer());
     const assetId = `${Date.now().toString(16)}${Math.random().toString(16).slice(2, 8)}`;
@@ -723,6 +1438,102 @@ const loadVmFromArchive = async (nextArchive: ScratchArchive) => {
         fileNames: currentArchive.fileNames.includes(md5ext) ? currentArchive.fileNames : [...currentArchive.fileNames, md5ext],
       }),
     );
+  };
+
+  const addLibraryAsset = async (asset: ScratchLibraryAsset) => {
+    // Fetch the asset from the Scratch CDN
+    try {
+      const resp = await fetch(assetUrl(asset.md5ext));
+      if (!resp.ok) throw new Error('Failed to fetch asset');
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      const base64 = bytesToBase64(bytes);
+
+      if (libraryOpen === 'sounds') {
+        await updateArchiveWithProject(
+          (current) => ({
+            ...current,
+            targets: current.targets.map((target, idx) => {
+              if (idx !== selectedTargetIndex) return target;
+              const sounds = target.sounds || [];
+              return {
+                ...target,
+                sounds: [...sounds, {
+                  name: asset.name,
+                  assetId: asset.assetId,
+                  md5ext: asset.md5ext,
+                  dataFormat: asset.dataFormat,
+                  rate: asset.rate || 44100,
+                  sampleCount: asset.sampleCount || 0,
+                }],
+              };
+            }),
+          }),
+          (currentArchive) => ({
+            ...currentArchive,
+            files: { ...currentArchive.files, [asset.md5ext]: base64 },
+            fileNames: currentArchive.fileNames.includes(asset.md5ext) ? currentArchive.fileNames : [...currentArchive.fileNames, asset.md5ext],
+          }),
+        );
+      } else if (libraryOpen === 'backdrops') {
+        await updateArchiveWithProject(
+          (current) => ({
+            ...current,
+            targets: current.targets.map((target) => {
+              if (!target.isStage) return target;
+              const costumes = target.costumes || [];
+              return {
+                ...target,
+                costumes: [...costumes, {
+                  name: asset.name,
+                  assetId: asset.assetId,
+                  md5ext: asset.md5ext,
+                  dataFormat: asset.dataFormat,
+                  rotationCenterX: asset.rotationCenterX || 240,
+                  rotationCenterY: asset.rotationCenterY || 180,
+                }],
+                currentCostume: costumes.length,
+              };
+            }),
+          }),
+          (currentArchive) => ({
+            ...currentArchive,
+            files: { ...currentArchive.files, [asset.md5ext]: base64 },
+            fileNames: currentArchive.fileNames.includes(asset.md5ext) ? currentArchive.fileNames : [...currentArchive.fileNames, asset.md5ext],
+          }),
+        );
+      } else {
+        // costumes
+        await updateArchiveWithProject(
+          (current) => ({
+            ...current,
+            targets: current.targets.map((target, idx) => {
+              if (idx !== selectedTargetIndex) return target;
+              const costumes = target.costumes || [];
+              return {
+                ...target,
+                costumes: [...costumes, {
+                  name: asset.name,
+                  assetId: asset.assetId,
+                  md5ext: asset.md5ext,
+                  dataFormat: asset.dataFormat,
+                  rotationCenterX: asset.rotationCenterX || 48,
+                  rotationCenterY: asset.rotationCenterY || 48,
+                }],
+                currentCostume: costumes.length,
+              };
+            }),
+          }),
+          (currentArchive) => ({
+            ...currentArchive,
+            files: { ...currentArchive.files, [asset.md5ext]: base64 },
+            fileNames: currentArchive.fileNames.includes(asset.md5ext) ? currentArchive.fileNames : [...currentArchive.fileNames, asset.md5ext],
+          }),
+        );
+      }
+    } catch (e) {
+      console.warn('Failed to add library asset:', e);
+    }
+    setLibraryOpen(null);
   };
 
   const addSprite = () => {
@@ -760,29 +1571,192 @@ const loadVmFromArchive = async (nextArchive: ScratchArchive) => {
 
   const SNAP_DISTANCE = 40;
   const BLOCK_HEIGHT = 42;
+  const C_BLOCK_INDENT = 24;
+  const C_BLOCK_MOUTH_HEIGHT = 24;
 
-  const findSnapTarget = (blocks: Record<string, ScratchBlockNode>, dropX: number, dropY: number, excludeId?: string): string | null => {
-    for (const [id, block] of Object.entries(blocks)) {
-      if (id === excludeId) continue;
-      if (block.next) continue; // already has a next block
-      const bx = block.x ?? 0;
-      const by = block.y ?? 0;
-      // Check if drop is near the bottom of this block
-      if (Math.abs(dropX - bx) < 80 && Math.abs(dropY - (by + BLOCK_HEIGHT)) < SNAP_DISTANCE) {
-        return id;
-      }
-    }
-    return null;
-  };
+  const cBlockOpcodes = new Set([
+    'control_forever', 'control_repeat', 'control_if', 'control_if_else',
+    'control_repeat_until', 'control_wait_until',
+  ]);
 
-  const getStackBottom = (blocks: Record<string, ScratchBlockNode>, startId: string): { x: number; y: number; count: number } => {
+  type SnapResult = { id: string; type: 'next' | 'substack' } | null;
+
+  const getStackLength = (blocks: Record<string, ScratchBlockNode>, startId: string) => {
+    let count = 1;
     let current = blocks[startId];
-    let count = 0;
     while (current?.next && blocks[current.next]) {
       current = blocks[current.next];
-      count++;
+      count += 1;
     }
-    return { x: current?.x ?? 0, y: (current?.y ?? 0), count };
+    return count;
+  };
+
+  const getStackTailId = (blocks: Record<string, ScratchBlockNode>, startId: string) => {
+    let tailId = startId;
+    let current = blocks[startId];
+    while (current?.next && blocks[current.next]) {
+      tailId = current.next;
+      current = blocks[current.next];
+    }
+    return tailId;
+  };
+
+  const getNextSnapY = (blocks: Record<string, ScratchBlockNode>, block: ScratchBlockNode) => {
+    const by = block.y ?? 0;
+    if (!cBlockOpcodes.has(block.opcode)) return by + BLOCK_HEIGHT;
+    const substackInput = block.inputs?.SUBSTACK as unknown[];
+    const substackRoot = typeof substackInput?.[1] === 'string' ? substackInput[1] : null;
+    const substackLen = substackRoot && blocks[substackRoot] ? getStackLength(blocks, substackRoot) : 1;
+    return by + BLOCK_HEIGHT + C_BLOCK_MOUTH_HEIGHT + substackLen * BLOCK_HEIGHT;
+  };
+
+  const getSnapPosition = (blocks: Record<string, ScratchBlockNode>, parent: ScratchBlockNode, type: 'next' | 'substack') => ({
+    x: type === 'substack' ? (parent.x ?? 0) + C_BLOCK_INDENT : (parent.x ?? 0),
+    y: type === 'substack' ? (parent.y ?? 0) + BLOCK_HEIGHT : getNextSnapY(blocks, parent),
+  });
+
+  const findSnapTarget = (blocks: Record<string, ScratchBlockNode>, dropX: number, dropY: number, excludeId?: string): SnapResult => {
+    let best: { id: string; type: 'next' | 'substack'; score: number } | null = null;
+
+    for (const [id, block] of Object.entries(blocks)) {
+      if (id === excludeId) continue;
+      const bx = block.x ?? 0;
+      const by = block.y ?? 0;
+
+      if (cBlockOpcodes.has(block.opcode)) {
+        const substackInput = block.inputs?.SUBSTACK as unknown[];
+        const substackRoot = typeof substackInput?.[1] === 'string' ? substackInput[1] : null;
+        const mouthX = bx + C_BLOCK_INDENT;
+        const mouthY = by + BLOCK_HEIGHT;
+        const dx = Math.abs(dropX - mouthX);
+        const dy = Math.abs(dropY - mouthY);
+
+        // Prefer dropping INSIDE the loop when pointer is near loop mouth/body.
+        if (dx < 90 && dy < SNAP_DISTANCE * 1.3) {
+          if (substackRoot && blocks[substackRoot]) {
+            const tailId = getStackTailId(blocks, substackRoot);
+            const tail = blocks[tailId];
+            const nextY = getNextSnapY(blocks, tail);
+            const score = Math.abs(dropX - (tail.x ?? 0)) + Math.abs(dropY - nextY);
+            if (!best || score < best.score) best = { id: tailId, type: 'next', score };
+          } else {
+            const score = dx + dy;
+            if (!best || score < best.score) best = { id, type: 'substack', score };
+          }
+        }
+      }
+
+      if (!block.next) {
+        const nextY = getNextSnapY(blocks, block);
+        const dx = Math.abs(dropX - bx);
+        const dy = Math.abs(dropY - nextY);
+        if (dx < 84 && dy < SNAP_DISTANCE) {
+          const score = dx + dy;
+          if (!best || score < best.score) best = { id, type: 'next', score };
+        }
+      }
+    }
+
+    return best ? { id: best.id, type: best.type } : null;
+  };
+
+  const createVariable = (name: string) => {
+    if (!selectedTarget || selectedTarget.isStage) return;
+    updateProject((current) => ({
+      ...current,
+      targets: current.targets.map((target, idx) => {
+        if (idx !== selectedTargetIndex) return target;
+        const vars = { ...(target.variables || {}) };
+        const id = generateId();
+        vars[id] = [name, 0];
+        return { ...target, variables: vars };
+      }),
+    }));
+  };
+
+  const createList = (name: string) => {
+    if (!selectedTarget || selectedTarget.isStage) return;
+    updateProject((current) => ({
+      ...current,
+      targets: current.targets.map((target, idx) => {
+        if (idx !== selectedTargetIndex) return target;
+        const lists = { ...(target.lists || {}) };
+        const id = generateId();
+        lists[id] = [name, []];
+        return { ...target, lists };
+      }),
+    }));
+  };
+
+  const deleteVariable = (id: string) => {
+    updateProject((current) => ({
+      ...current,
+      targets: current.targets.map((target, idx) => {
+        if (idx !== selectedTargetIndex) return target;
+        const vars = { ...(target.variables || {}) };
+        delete vars[id];
+        return { ...target, variables: vars };
+      }),
+    }));
+  };
+
+  const deleteList = (id: string) => {
+    updateProject((current) => ({
+      ...current,
+      targets: current.targets.map((target, idx) => {
+        if (idx !== selectedTargetIndex) return target;
+        const l = { ...(target.lists || {}) };
+        delete l[id];
+        return { ...target, lists: l };
+      }),
+    }));
+  };
+
+  const renameVariable = (id: string, oldName: string) => {
+    setDataPrompt({ type: 'variable', name: oldName });
+    // After submit, we need to update the variable name in-place
+    // We'll handle this by deleting + re-creating — but simpler: just update directly
+    // Use a special rename flow
+    setRenameTarget({ type: 'variable', id, oldName });
+  };
+
+  const renameList = (id: string, oldName: string) => {
+    setDataPrompt({ type: 'list', name: oldName });
+    setRenameTarget({ type: 'list', id, oldName });
+  };
+
+  // renameTarget state moved to top of component (line ~746)
+
+  const handleDataPromptSubmit = () => {
+    if (!dataPrompt || !dataPrompt.name.trim()) return;
+    if (renameTarget) {
+      // Rename in-place
+      const newName = dataPrompt.name.trim();
+      updateProject((current) => ({
+        ...current,
+        targets: current.targets.map((target, idx) => {
+          if (idx !== selectedTargetIndex) return target;
+          if (renameTarget.type === 'variable') {
+            const vars = { ...(target.variables || {}) };
+            if (vars[renameTarget.id]) {
+              vars[renameTarget.id] = [newName, vars[renameTarget.id][1]];
+            }
+            return { ...target, variables: vars };
+          } else {
+            const l = { ...(target.lists || {}) };
+            if (l[renameTarget.id]) {
+              l[renameTarget.id] = [newName, l[renameTarget.id][1]];
+            }
+            return { ...target, lists: l };
+          }
+        }),
+      }));
+      setRenameTarget(null);
+    } else {
+      if (dataPrompt.type === 'variable') createVariable(dataPrompt.name.trim());
+      else createList(dataPrompt.name.trim());
+    }
+    setDataPrompt(null);
   };
 
   const addBlock = (blockDef: ScratchBlockDef, dropX?: number, dropY?: number) => {
@@ -792,24 +1766,16 @@ const loadVmFromArchive = async (nextArchive: ScratchArchive) => {
     const finalX = dropX ?? 40;
     const finalY = dropY ?? (30 + blockCount * 55);
 
-    updateProject((current) => ({
+    const extId = getExtensionId(blockDef.opcode);
+    updateProject((current) => {
+      const extensions = extId && !current.extensions?.includes(extId)
+        ? [...(current.extensions as string[] || []), extId]
+        : current.extensions;
+      return {
       ...current,
+      extensions,
       targets: current.targets.map((target, idx) => {
         if (idx !== selectedTargetIndex) return target;
-        if (blockDef.action === 'create_variable') {
-          const vars = { ...(target.variables || {}) };
-          const id = generateId();
-          const name = getUniqueDataName(Object.values(vars).map(([n]) => n), 'my variable');
-          vars[id] = [name, 0];
-          return { ...target, variables: vars };
-        }
-        if (blockDef.action === 'create_list') {
-          const lists = { ...(target.lists || {}) };
-          const id = generateId();
-          const name = getUniqueDataName(Object.values(lists).map(([n]) => n), 'my list');
-          lists[id] = [name, []];
-          return { ...target, lists };
-        }
 
         const blocks = { ...(target.blocks || {}) };
         const dataResolved = ensureDataRefForTarget(target, blockDef);
@@ -817,25 +1783,44 @@ const loadVmFromArchive = async (nextArchive: ScratchArchive) => {
           ...blockDef,
           fields: dataResolved.fields,
         };
-        const snapParentId = findSnapTarget(blocks, finalX, finalY);
+        const snapResult = findSnapTarget(blocks, finalX, finalY);
 
-        if (snapParentId && blocks[snapParentId]) {
-          const parent = blocks[snapParentId];
-          const snapX = parent.x ?? 0;
-          const snapY = (parent.y ?? 0) + BLOCK_HEIGHT;
+        if (snapResult && blocks[snapResult.id]) {
+          const parent = blocks[snapResult.id];
           const vmCompatible = createVmCompatibleBlockShape(blockId, resolvedBlockDef);
-          blocks[snapParentId] = { ...parent, next: blockId };
-          blocks[blockId] = {
-            id: blockId,
-            opcode: blockDef.opcode,
-            next: null,
-            parent: snapParentId,
-            topLevel: false,
-            x: snapX,
-            y: snapY,
-            inputs: vmCompatible.inputs,
-            fields: vmCompatible.fields,
-          };
+
+          if (snapResult.type === 'substack') {
+            // Insert inside C-block mouth
+            const { x: snapX, y: snapY } = getSnapPosition(blocks, parent, 'substack');
+            const parentInputs = { ...(parent.inputs || {}), SUBSTACK: [2, blockId] };
+            blocks[snapResult.id] = { ...parent, inputs: parentInputs };
+            blocks[blockId] = {
+              id: blockId,
+              opcode: blockDef.opcode,
+              next: null,
+              parent: snapResult.id,
+              topLevel: false,
+              x: snapX,
+              y: snapY,
+              inputs: vmCompatible.inputs,
+              fields: vmCompatible.fields,
+            };
+          } else {
+            // Standard next-block snap
+            const { x: snapX, y: snapY } = getSnapPosition(blocks, parent, 'next');
+            blocks[snapResult.id] = { ...parent, next: blockId };
+            blocks[blockId] = {
+              id: blockId,
+              opcode: blockDef.opcode,
+              next: null,
+              parent: snapResult.id,
+              topLevel: false,
+              x: snapX,
+              y: snapY,
+              inputs: vmCompatible.inputs,
+              fields: vmCompatible.fields,
+            };
+          }
           Object.assign(blocks, vmCompatible.extraBlocks);
         } else {
           if (isEventBlock(blockDef.opcode)) {
@@ -881,7 +1866,8 @@ const loadVmFromArchive = async (nextArchive: ScratchArchive) => {
 
         return { ...dataResolved.target, blocks };
       }),
-    }));
+      };
+    });
   };
 
   const handleWorkspaceDrop = (e: React.DragEvent) => {
@@ -895,63 +1881,195 @@ const loadVmFromArchive = async (nextArchive: ScratchArchive) => {
     } catch { /* ignore */ }
   };
 
-  const handleBlockDragInWorkspace = (blockId: string, e: React.DragEvent) => {
-    const rect = e.currentTarget.closest('.scratch-workspace')?.getBoundingClientRect();
-    if (!rect) return;
-    const x = (e.clientX - rect.left) / workspaceZoom;
-    const y = (e.clientY - rect.top) / workspaceZoom;
-    updateProject((current) => ({
-      ...current,
-      targets: current.targets.map((target, idx) => {
-        if (idx !== selectedTargetIndex) return target;
-        const blocks = { ...(target.blocks || {}) };
-        const block = blocks[blockId];
-        if (!block) return target;
+  // ── Pointer-based block dragging ──
+  const getWorkspaceCoords = useCallback((clientX: number, clientY: number) => {
+    const ws = workspaceRef.current;
+    if (!ws) return { x: 0, y: 0 };
+    const rect = ws.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) / workspaceZoom,
+      y: (clientY - rect.top) / workspaceZoom,
+    };
+  }, [workspaceZoom]);
 
-        // Detach from old parent
-        if (block.parent && blocks[block.parent]) {
-          blocks[block.parent] = { ...blocks[block.parent], next: null };
+  const getBlockStack = useCallback((blocks: Record<string, ScratchBlockNode>, startId: string): string[] => {
+    const ids: string[] = [startId];
+    let current = blocks[startId];
+    while (current?.next && blocks[current.next]) {
+      ids.push(current.next);
+      current = blocks[current.next];
+    }
+    // Also include SUBSTACK children recursively
+    for (const id of [...ids]) {
+      const b = blocks[id];
+      if (b?.inputs) {
+        const sub = b.inputs.SUBSTACK as unknown[];
+        if (sub && sub[1] && typeof sub[1] === 'string' && blocks[sub[1]]) {
+          ids.push(...getBlockStack(blocks, sub[1] as string));
         }
+      }
+    }
+    return ids;
+  }, []);
 
-        // Try snapping to a new parent
-        const snapParentId = findSnapTarget(blocks, x, y, blockId);
-        if (snapParentId && blocks[snapParentId]) {
-          const parent = blocks[snapParentId];
-          const snapX = parent.x ?? 0;
-          const snapY = (parent.y ?? 0) + BLOCK_HEIGHT;
-          blocks[snapParentId] = { ...parent, next: blockId };
-          blocks[blockId] = { ...block, x: snapX, y: snapY, parent: snapParentId, topLevel: false };
-        } else {
-          blocks[blockId] = { ...block, x, y, parent: null, topLevel: true };
-        }
+  const handleBlockPointerDown = useCallback((blockId: string, e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const { x, y } = getWorkspaceCoords(e.clientX, e.clientY);
+    const block = selectedTarget?.blocks?.[blockId];
+    if (!block) return;
 
-        return { ...target, blocks };
-      }),
-    }));
-  };
+    dragRef.current = {
+      blockId,
+      startX: x,
+      startY: y,
+      offsetX: x - (block.x ?? 0),
+      offsetY: y - (block.y ?? 0),
+      originalBlock: { ...block },
+      detached: false,
+    };
+    setDragBlockId(blockId);
+    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+  }, [getWorkspaceCoords, selectedTarget]);
+
+  const handleWorkspacePointerMove = useCallback((e: React.PointerEvent) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+
+    const { x, y } = getWorkspaceCoords(e.clientX, e.clientY);
+    const newX = x - drag.offsetX;
+    const newY = y - drag.offsetY;
+
+    // Detach from parent on first move
+    if (!drag.detached) {
+      drag.detached = true;
+      updateProject((current) => ({
+        ...current,
+        targets: current.targets.map((target, idx) => {
+          if (idx !== selectedTargetIndex) return target;
+          const blocks = { ...(target.blocks || {}) };
+          const block = blocks[drag.blockId];
+          if (!block) return target;
+          if (block.parent && blocks[block.parent]) {
+            const oldParent = { ...blocks[block.parent] };
+            if (oldParent.next === drag.blockId) {
+              oldParent.next = null;
+            }
+            if (oldParent.inputs) {
+              const substackVal = oldParent.inputs.SUBSTACK as unknown[];
+              if (substackVal && substackVal[1] === drag.blockId) {
+                oldParent.inputs = { ...oldParent.inputs, SUBSTACK: [2, null] };
+              }
+            }
+            blocks[block.parent] = oldParent;
+          }
+          blocks[drag.blockId] = { ...block, x: newX, y: newY, parent: null, topLevel: true };
+
+          // Move child stack too
+          const stackIds = getBlockStack(blocks, drag.blockId).slice(1);
+          const dx = newX - (drag.originalBlock.x ?? 0);
+          const dy = newY - (drag.originalBlock.y ?? 0);
+          stackIds.forEach(sid => {
+            if (blocks[sid]) {
+              blocks[sid] = { ...blocks[sid], x: (blocks[sid].x ?? 0) + dx, y: (blocks[sid].y ?? 0) + dy };
+            }
+          });
+
+          return { ...target, blocks };
+        }),
+      }));
+    } else {
+      // Update position during drag
+      updateProject((current) => ({
+        ...current,
+        targets: current.targets.map((target, idx) => {
+          if (idx !== selectedTargetIndex) return target;
+          const blocks = { ...(target.blocks || {}) };
+          if (!blocks[drag.blockId]) return target;
+          const oldX = blocks[drag.blockId].x ?? 0;
+          const oldY = blocks[drag.blockId].y ?? 0;
+          const dx = newX - oldX;
+          const dy = newY - oldY;
+          blocks[drag.blockId] = { ...blocks[drag.blockId], x: newX, y: newY };
+          // Move child stack
+          const stackIds = getBlockStack(blocks, drag.blockId).slice(1);
+          stackIds.forEach(sid => {
+            if (blocks[sid]) {
+              blocks[sid] = { ...blocks[sid], x: (blocks[sid].x ?? 0) + dx, y: (blocks[sid].y ?? 0) + dy };
+            }
+          });
+          return { ...target, blocks };
+        }),
+      }));
+    }
+
+    // Compute snap preview
+    const blocks = selectedTarget?.blocks || {};
+    const snap = findSnapTarget(blocks, newX, newY, drag.blockId);
+    if (snap && blocks[snap.id]) {
+      const parent = blocks[snap.id];
+      const { x: snapX, y: snapY } = getSnapPosition(blocks, parent, snap.type);
+      setSnapPreview({ ...snap, x: snapX, y: snapY });
+    } else {
+      setSnapPreview(null);
+    }
+  }, [getWorkspaceCoords, selectedTarget, selectedTargetIndex, updateProject, getBlockStack]);
+
+  const handleWorkspacePointerUp = useCallback(() => {
+    const drag = dragRef.current;
+    if (!drag) return;
+
+    const snap = snapPreview;
+    if (snap) {
+      updateProject((current) => ({
+        ...current,
+        targets: current.targets.map((target, idx) => {
+          if (idx !== selectedTargetIndex) return target;
+          const blocks = { ...(target.blocks || {}) };
+          const block = blocks[drag.blockId];
+          if (!block || !blocks[snap.id]) return target;
+
+          const parent = blocks[snap.id];
+          if (snap.type === 'substack') {
+            const { x: snapX, y: snapY } = getSnapPosition(blocks, parent, 'substack');
+            const dx = snapX - (block.x ?? 0);
+            const dy = snapY - (block.y ?? 0);
+            blocks[snap.id] = { ...parent, inputs: { ...(parent.inputs || {}), SUBSTACK: [2, drag.blockId] } };
+            blocks[drag.blockId] = { ...block, x: snapX, y: snapY, parent: snap.id, topLevel: false };
+            const stackIds = getBlockStack(blocks, drag.blockId).slice(1);
+            stackIds.forEach(sid => {
+              if (blocks[sid]) blocks[sid] = { ...blocks[sid], x: (blocks[sid].x ?? 0) + dx, y: (blocks[sid].y ?? 0) + dy };
+            });
+          } else {
+            const { x: snapX, y: snapY } = getSnapPosition(blocks, parent, 'next');
+            const dx = snapX - (block.x ?? 0);
+            const dy = snapY - (block.y ?? 0);
+            blocks[snap.id] = { ...parent, next: drag.blockId };
+            blocks[drag.blockId] = { ...block, x: snapX, y: snapY, parent: snap.id, topLevel: false };
+            const stackIds = getBlockStack(blocks, drag.blockId).slice(1);
+            stackIds.forEach(sid => {
+              if (blocks[sid]) blocks[sid] = { ...blocks[sid], x: (blocks[sid].x ?? 0) + dx, y: (blocks[sid].y ?? 0) + dy };
+            });
+          }
+          return { ...target, blocks };
+        }),
+      }));
+    }
+
+    dragRef.current = null;
+    setDragBlockId(null);
+    setSnapPreview(null);
+  }, [snapPreview, selectedTargetIndex, updateProject, getBlockStack]);
 
   const runPreview = async () => {
-    try {
-      if (!vmRef.current) return;
-      onRun();
-      vmRef.current.greenFlag();
-      setTimeout(() => {
-        syncFromVm();
-      }, 120);
-    } catch (error) {
-      setVmError(error instanceof Error ? error.message : 'VM runtime error.');
-      onStop();
-    }
+    if (!vmRef.current || !vmReady) return;
+    const currentArchive = ensureArchive(archive);
+    await loadVmFromArchive(currentArchive);
+    onRun(); // Effect will call greenFlag() on freshly loaded project
   };
 
   const handleVmStop = () => {
-    try {
-      vmRef.current?.stopAll();
-      syncFromVm();
-    } catch {
-      // noop
-    }
-    onStop();
+    onStop(); // Effect will call stopAll()
   };
 
   const handleImport = async (file: File) => {
@@ -995,130 +2113,180 @@ const loadVmFromArchive = async (nextArchive: ScratchArchive) => {
     }
   };
 
+  const [showJson, setShowJson] = useState(false);
+
   return (
-    <div className="h-full bg-[#f1f4fa] flex flex-col text-[#4d4d4d]">
-      <div className="h-9 border-b border-[#c8d0dd] bg-[#d9e3f2] px-2 flex items-center justify-between">
-        <div className="flex items-center gap-1">
-          <button
-            onClick={() => setActiveEditorTab('code')}
-            className={`px-4 h-7 rounded-t-xl text-sm flex items-center gap-1 ${activeEditorTab === 'code' ? 'bg-white text-[#6b5ce7] font-semibold' : 'bg-[#c9d3e4]'}`}
-          >
-            <Code2 className="w-4 h-4" /> Code
-          </button>
-          <button
-            onClick={() => setActiveEditorTab('costumes')}
-            className={`px-4 h-7 rounded-t-xl text-sm flex items-center gap-1 ${activeEditorTab === 'costumes' ? 'bg-white text-[#5a6b8a] font-semibold' : 'bg-[#c9d3e4]'}`}
-          >
-            <Brush className="w-4 h-4" /> Costumes
-          </button>
-          <button
-            onClick={() => setActiveEditorTab('sounds')}
-            className={`px-4 h-7 rounded-t-xl text-sm flex items-center gap-1 ${activeEditorTab === 'sounds' ? 'bg-white text-[#5a6b8a] font-semibold' : 'bg-[#c9d3e4]'}`}
-          >
-            <Volume2 className="w-4 h-4" /> Sounds
-          </button>
+    <div className="h-full flex flex-col" style={{ background: '#855cd6' }}>
+      {/* ===== TOP MENU BAR (Scratch purple) ===== */}
+      <div className="h-12 flex items-center px-3 gap-4 shrink-0" style={{ background: '#855cd6' }}>
+        {/* Logo / brand */}
+        <div className="flex items-center gap-2">
+          <div className="w-8 h-8 rounded-lg bg-white/20 flex items-center justify-center">
+            <span className="text-white font-bold text-sm">S</span>
+          </div>
         </div>
 
-        <div className="flex items-center gap-3">
-          <span className={`text-[11px] px-2 py-0.5 rounded-full border ${vmReady ? 'border-green-400 text-green-700 bg-green-50' : 'border-amber-400 text-amber-700 bg-amber-50'}`}>
-            {vmReady ? 'VM Ready' : 'VM Starting'}
-          </span>
-          <button onClick={runPreview} className="text-green-600" title="Green Flag" disabled={isRunning || !vmReady}>
-            <Flag className="w-5 h-5 fill-green-500" />
+        {/* File actions */}
+        <div className="flex items-center gap-1">
+          <button onClick={() => importInputRef.current?.click()} className="px-3 py-1.5 text-white/90 text-[13px] rounded hover:bg-white/10 flex items-center gap-1.5">
+            <Upload className="w-3.5 h-3.5" /> File
           </button>
-          <button onClick={handleVmStop} className="text-red-500" title="Stop">
-            <StopCircle className="w-5 h-5 fill-red-300" />
-          </button>
-          <button onClick={handleExport} className="px-2 py-1 text-xs rounded bg-white border border-[#c8d0dd]">Export .sb3</button>
-          <button onClick={() => importInputRef.current?.click()} className="px-2 py-1 text-xs rounded bg-white border border-[#c8d0dd]">Import .sb3</button>
-          <input
-            ref={importInputRef}
-            className="hidden"
-            type="file"
-            accept=".sb3"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) handleImport(file);
-            }}
-          />
+          <input ref={importInputRef} className="hidden" type="file" accept=".sb3" onChange={(e) => { const file = e.target.files?.[0]; if (file) handleImport(file); }} />
+          <button onClick={handleExport} className="px-3 py-1.5 text-white/90 text-[13px] rounded hover:bg-white/10">Save</button>
+          <button onClick={() => setShowJson(!showJson)} className="px-3 py-1.5 text-white/90 text-[13px] rounded hover:bg-white/10">Debug</button>
         </div>
+
+        <div className="flex-1" />
+
+        {/* VM status */}
+        <span className={`text-[11px] px-2 py-0.5 rounded-full ${vmReady ? 'bg-white/20 text-white' : 'bg-yellow-400/30 text-yellow-100'}`}>
+          {vmReady ? '● Ready' : '○ Starting'}
+        </span>
       </div>
 
-      <div className="flex-1 min-h-0 grid grid-cols-[340px_1fr_520px]">
-        <div className="border-r border-[#c8d0dd] bg-[#f3f5fb] flex min-h-0">
-          <div className="w-[74px] border-r border-[#d6ddea] p-2 space-y-2 overflow-y-auto">
-            {categoryRail.map((cat) => (
-              <button
-                key={cat.name}
-                onClick={() => setActiveCategory(cat.name)}
-                className={`w-full flex flex-col items-center text-[12px] gap-0.5 ${activeCategory === cat.name ? 'text-[#3373cc] font-semibold' : 'text-[#5e6a83]'}`}
-              >
-                <span className={`w-7 h-7 rounded-full border ${activeCategory === cat.name ? 'border-[#3373cc] ring-2 ring-[#4c97ff]/30' : 'border-[#aeb8cc]'}`} style={{ backgroundColor: cat.color }} />
-                {cat.name}
-              </button>
-            ))}
+      {/* ===== TABS BAR (Code / Costumes / Sounds) ===== */}
+      <div className="h-11 flex items-end px-2 shrink-0" style={{ background: '#855cd6' }}>
+        {[
+          { key: 'code' as const, icon: <Code2 className="w-4 h-4" />, label: 'Code' },
+          { key: 'costumes' as const, icon: <Brush className="w-4 h-4" />, label: 'Costumes' },
+          { key: 'sounds' as const, icon: <Volume2 className="w-4 h-4" />, label: 'Sounds' },
+        ].map((tab) => (
+          <button
+            key={tab.key}
+            onClick={() => setActiveEditorTab(tab.key)}
+            className={`px-5 h-9 rounded-t-lg text-[13px] font-semibold flex items-center gap-1.5 transition-colors ${
+              activeEditorTab === tab.key
+                ? 'bg-white text-[#855cd6]'
+                : 'bg-[#7953c7] text-white/80 hover:bg-[#7248bf]'
+            }`}
+          >
+            {tab.icon} {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* ===== MAIN CONTENT ===== */}
+      <div className="flex-1 min-h-0 flex bg-white">
+        {/* --- LEFT: Category rail + Block flyout --- */}
+        <div className="flex min-h-0 shrink-0" style={{ width: 340 }}>
+          {/* Category rail */}
+          <div className="w-[64px] bg-[#f9f9f9] border-r border-[#e0e0e0] py-2 flex flex-col items-center gap-1 overflow-y-auto shrink-0">
+            {categoryRail.map((cat) => {
+              const isActive = activeCategory === cat.name;
+              return (
+                <button
+                  key={cat.name}
+                  onClick={() => setActiveCategory(cat.name)}
+                  className={`w-full flex flex-col items-center gap-0.5 py-1.5 text-[10px] leading-tight transition-colors ${
+                    isActive ? 'font-bold' : 'text-[#575e75]'
+                  }`}
+                  style={isActive ? { color: cat.color } : undefined}
+                >
+                  <span
+                    className="w-6 h-6 rounded-full"
+                    style={{
+                      backgroundColor: cat.color,
+                      boxShadow: isActive ? `0 0 0 2px white, 0 0 0 4px ${cat.color}` : 'none',
+                    }}
+                  />
+                  <span className="mt-0.5">{cat.name}</span>
+                </button>
+              );
+            })}
           </div>
 
-          <div className="flex-1 p-2 overflow-y-auto">
-            <div className="text-[28px] leading-none mb-1" style={{ color: categoryColors[activeCategory] || '#4c97ff' }}>{activeCategory}</div>
+          {/* Block flyout */}
+          <div className="flex-1 overflow-y-auto py-3 px-3" style={{ background: '#f9f9f9' }}>
+            <div className="text-[18px] font-bold mb-3" style={{ color: categoryColors[activeCategory] || '#4c97ff' }}>
+              {activeCategory}
+            </div>
             {activeEditorTab === 'code' ? (
-              <div className="space-y-2 pr-2">
-                {(categoryBlocks[activeCategory] || []).map((blockDef) => (
-                  <button
-                    key={blockDef.label}
-                    draggable
-                    onDragStart={(e) => {
-                      e.dataTransfer.setData('application/scratch-block', JSON.stringify(blockDef));
-                      e.dataTransfer.effectAllowed = 'copy';
-                    }}
-                    onClick={() => addBlock(blockDef)}
-                    className="w-full text-left rounded-2xl text-white text-[15px] px-4 py-2 shadow-[inset_0_-2px_0_rgba(0,0,0,0.2)] hover:brightness-110 cursor-grab active:cursor-grabbing"
-                    style={{ backgroundColor: categoryColors[activeCategory] || '#4c97ff' }}
-                  >
-                    {blockDef.label}
-                  </button>
-                ))}
+              activeCategory === 'Variables' ? (
+                <VariablesFlyout
+                  variables={Object.entries(selectedTarget?.variables || {})}
+                  lists={Object.entries(selectedTarget?.lists || {})}
+                  blocks={categoryBlocks['Variables'] || []}
+                  color={categoryColors['Variables'] || '#ff8c1a'}
+                  onMakeVariable={() => { setRenameTarget(null); setDataPrompt({ type: 'variable', name: '' }); }}
+                  onMakeList={() => { setRenameTarget(null); setDataPrompt({ type: 'list', name: '' }); }}
+                  onAddBlock={addBlock}
+                  onDeleteVariable={deleteVariable}
+                  onDeleteList={deleteList}
+                  onRenameVariable={renameVariable}
+                  onRenameList={renameList}
+                />
+              ) : (
+              <div className="space-y-1.5">
+                {(categoryBlocks[activeCategory] || []).map((blockDef) => {
+                  const color = categoryColors[activeCategory] || '#4c97ff';
+                  const shape = getBlockShape(blockDef.opcode);
+                  return (
+                    <div
+                      key={blockDef.label}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData('application/scratch-block', JSON.stringify(blockDef));
+                        e.dataTransfer.effectAllowed = 'copy';
+                      }}
+                      onClick={() => addBlock(blockDef)}
+                      className="cursor-grab active:cursor-grabbing hover:brightness-110 transition-all"
+                    >
+                      <ScratchBlockShape label={blockDef.label} color={color} shape={shape} />
+                    </div>
+                  );
+                })}
               </div>
+              )
             ) : activeEditorTab === 'costumes' ? (
-              <div className="h-full rounded-lg border border-[#cfdbef] bg-white p-3 text-sm text-[#5a6682] flex flex-col gap-3">
-                <div className="flex items-center justify-between">
-                  <div className="font-semibold">Costumes ({selectedCostumes.length})</div>
-                  <button className="px-3 py-1.5 rounded-full border border-[#c6d3ea] flex items-center gap-1" onClick={() => costumeInputRef.current?.click()}>
-                    <Upload className="w-3 h-3" /> Upload
-                  </button>
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-1">
+                  <span className="text-sm font-semibold text-[#575e75]">Costumes ({selectedCostumes.length})</span>
+                  <div className="flex gap-1">
+                    <button className="px-2.5 py-1 rounded-full bg-[#855cd6] text-white text-xs flex items-center gap-1" onClick={() => setLibraryOpen('costumes')}>
+                      Choose
+                    </button>
+                    <button className="px-2.5 py-1 rounded-full bg-[#575e75] text-white text-xs flex items-center gap-1" onClick={() => costumeInputRef.current?.click()}>
+                      <Upload className="w-3 h-3" /> Upload
+                    </button>
+                  </div>
                   <input ref={costumeInputRef} className="hidden" type="file" accept="image/*,.svg" onChange={(e) => e.target.files?.[0] && addCostume(e.target.files[0])} />
                 </div>
-                <div className="grid grid-cols-2 gap-2 overflow-auto">
+                <div className="grid grid-cols-2 gap-2">
                   {selectedCostumes.map((costume, idx) => {
-                    const src = archive?.files?.[costume.md5ext] ? `data:image/${costume.dataFormat || 'png'};base64,${archive.files[costume.md5ext]}` : undefined;
+                    const src = archive?.files?.[costume.md5ext] ? `data:${imgMime(costume.dataFormat)};base64,${archive.files[costume.md5ext]}` : undefined;
                     return (
-                      <button key={costume.assetId} className={`rounded-lg border p-2 text-left ${idx === currentCostumeIndex ? 'border-[#7a5cff] bg-[#f2efff]' : 'border-[#d7deec]'}`} onClick={() => setCurrentCostume(idx)}>
-                        <div className="h-16 rounded bg-[#f4f7ff] border border-[#e3e9f5] flex items-center justify-center overflow-hidden">
-                          {src ? <img src={src} alt={costume.name} className="max-h-full max-w-full" /> : <span>🎭</span>}
+                      <button key={costume.assetId} className={`rounded-lg border-2 p-2 ${idx === currentCostumeIndex ? 'border-[#855cd6] bg-[#f0ebff]' : 'border-[#e0e0e0]'}`} onClick={() => setCurrentCostume(idx)}>
+                        <div className="h-16 rounded bg-[#f4f7ff] flex items-center justify-center overflow-hidden">
+                          {src ? <img src={src} alt={costume.name} className="max-h-full max-w-full" /> : <span className="text-2xl">🎭</span>}
                         </div>
-                        <div className="mt-1 text-xs truncate">{costume.name}</div>
+                        <div className="mt-1 text-[11px] text-[#575e75] truncate text-center">{idx + 1}. {costume.name}</div>
                       </button>
                     );
                   })}
                 </div>
               </div>
             ) : (
-              <div className="h-full rounded-lg border border-[#cfdbef] bg-white p-3 text-sm text-[#5a6682] flex flex-col gap-3">
-                <div className="flex items-center justify-between">
-                  <div className="font-semibold">Sounds ({selectedSounds.length})</div>
-                  <button className="px-3 py-1.5 rounded-full border border-[#c6d3ea] flex items-center gap-1" onClick={() => soundInputRef.current?.click()}>
-                    <Upload className="w-3 h-3" /> Upload
-                  </button>
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-1">
+                  <span className="text-sm font-semibold text-[#575e75]">Sounds ({selectedSounds.length})</span>
+                  <div className="flex gap-1">
+                    <button className="px-2.5 py-1 rounded-full bg-[#cf63cf] text-white text-xs flex items-center gap-1" onClick={() => setLibraryOpen('sounds')}>
+                      Choose
+                    </button>
+                    <button className="px-2.5 py-1 rounded-full bg-[#575e75] text-white text-xs flex items-center gap-1" onClick={() => soundInputRef.current?.click()}>
+                      <Upload className="w-3 h-3" /> Upload
+                    </button>
+                  </div>
                   <input ref={soundInputRef} className="hidden" type="file" accept="audio/*" onChange={(e) => e.target.files?.[0] && addSound(e.target.files[0])} />
                 </div>
-                <div className="space-y-2 overflow-auto">
+                <div className="space-y-1.5">
                   {selectedSounds.map((sound) => {
                     const src = archive?.files?.[sound.md5ext] ? `data:audio/${sound.dataFormat || 'wav'};base64,${archive.files[sound.md5ext]}` : '';
                     return (
-                      <div key={sound.assetId} className="rounded-lg border border-[#d7deec] p-2 flex items-center justify-between gap-2">
-                        <div className="truncate">{sound.name}</div>
+                      <div key={sound.assetId} className="rounded-lg border border-[#e0e0e0] bg-white p-2 flex items-center justify-between">
+                        <span className="text-[13px] text-[#575e75] truncate">{sound.name}</span>
                         <button
-                          className="w-7 h-7 rounded-full border border-[#c4cee2] flex items-center justify-center"
+                          className="w-7 h-7 rounded-full bg-[#855cd6] text-white flex items-center justify-center"
                           onClick={() => {
                             if (!src) return;
                             if (!audioPreviewRef.current) audioPreviewRef.current = new Audio();
@@ -1137,130 +2305,272 @@ const loadVmFromArchive = async (nextArchive: ScratchArchive) => {
           </div>
         </div>
 
-        <div
-          className="relative bg-[#f9fafc] overflow-hidden scratch-workspace"
+        {/* --- CENTER: Workspace --- */}
+        <div className="flex-1 min-w-0 relative overflow-hidden scratch-workspace" style={{ background: '#fff' }}
           onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
           onDrop={handleWorkspaceDrop}
+          onPointerMove={handleWorkspacePointerMove}
+          onPointerUp={handleWorkspacePointerUp}
+          onPointerLeave={handleWorkspacePointerUp}
+          ref={workspaceRef}
         >
           <div
             className="absolute inset-0"
             style={{
               transform: `scale(${workspaceZoom})`,
               transformOrigin: 'top left',
-              backgroundImage: 'radial-gradient(#d8deea 1px, transparent 1px)',
-              backgroundSize: '32px 32px',
+              backgroundImage: 'radial-gradient(#e0e0e0 1px, transparent 1px)',
+              backgroundSize: '24px 24px',
             }}
           >
-            {selectedBlocks.map((block) => {
+            {selectedBlocks.filter((block) => block.opcode && !block.shadow && (block.x !== undefined || block.topLevel)).map((block) => {
               const blockColor = getBlockColor(block.opcode);
+              const shape = getBlockShape(block.opcode);
+              const label = blockLabels[block.opcode] || block.opcode.replace(/_/g, ' ');
+              const isDragging = block.id === dragBlockId;
               return (
                 <div
                   key={block.id}
-                  draggable
-                  onDragEnd={(e) => handleBlockDragInWorkspace(block.id, e)}
-                  className="absolute rounded-2xl text-white px-3 py-2 text-[13px] min-w-[200px] shadow cursor-grab active:cursor-grabbing select-none border-b-2 border-black/20"
-                  style={{ left: block.x ?? 40, top: block.y ?? 40, backgroundColor: blockColor }}
+                  onPointerDown={(e) => handleBlockPointerDown(block.id, e)}
+                  className={`absolute select-none touch-none ${isDragging ? 'cursor-grabbing z-50 opacity-80' : 'cursor-grab'}`}
+                  style={{
+                    left: block.x ?? 40,
+                    top: block.y ?? 40,
+                    transition: isDragging ? 'none' : 'left 0.08s ease-out, top 0.08s ease-out',
+                  }}
                 >
-                  <div className="font-medium">{blockLabels[block.opcode] || block.opcode.replace(/_/g, ' ')}</div>
+                  <ScratchBlockShape label={label} color={blockColor} shape={shape} />
                 </div>
               );
             })}
+            {/* Snap preview indicator */}
+            {snapPreview && (
+              <div
+                className="absolute pointer-events-none z-40"
+                style={{ left: snapPreview.x, top: snapPreview.y }}
+              >
+                <div className="h-1 w-24 rounded-full bg-white shadow-[0_0_8px_2px_rgba(255,255,255,0.8)]" />
+              </div>
+            )}
           </div>
-          <div className="absolute right-3 bottom-3 flex flex-col gap-2">
-            <button className="w-9 h-9 rounded-full bg-white border border-[#c8d0dd] flex items-center justify-center" onClick={() => setWorkspaceZoom((z) => Math.min(1.4, z + 0.1))}><ZoomIn className="w-4 h-4" /></button>
-            <button className="w-9 h-9 rounded-full bg-white border border-[#c8d0dd] flex items-center justify-center" onClick={() => setWorkspaceZoom((z) => Math.max(0.7, z - 0.1))}><ZoomOut className="w-4 h-4" /></button>
-            <button className="w-9 h-9 rounded-full bg-white border border-[#c8d0dd] flex items-center justify-center" onClick={() => setWorkspaceZoom(1)}><CircleMinus className="w-4 h-4" /></button>
+          {/* Zoom controls */}
+          <div className="absolute right-3 bottom-3 flex flex-col gap-1.5">
+            <button className="w-8 h-8 rounded-full bg-[#855cd6] text-white flex items-center justify-center shadow-md hover:bg-[#7248bf]" onClick={() => setWorkspaceZoom((z) => Math.min(1.4, z + 0.1))}><ZoomIn className="w-4 h-4" /></button>
+            <button className="w-8 h-8 rounded-full bg-[#855cd6] text-white flex items-center justify-center shadow-md hover:bg-[#7248bf]" onClick={() => setWorkspaceZoom((z) => Math.max(0.7, z - 0.1))}><ZoomOut className="w-4 h-4" /></button>
+            <button className="w-8 h-8 rounded-full bg-white border border-[#d0d0d0] text-[#575e75] flex items-center justify-center shadow-md" onClick={() => setWorkspaceZoom(1)}><CircleMinus className="w-4 h-4" /></button>
           </div>
         </div>
 
-        <div className="border-l border-[#c8d0dd] bg-[#e5edf9] grid grid-rows-[430px_1fr] min-h-0">
-          <div className="p-2">
-              <div className="rounded-xl bg-white border border-[#c8d0dd] h-full relative overflow-hidden">
-              <div className="absolute left-0 top-0 right-0 h-full bg-[#f0f0f0]" />
-              {stagePreview.visible && spriteVisible && (
-                <div
-                  className="absolute text-[100px] leading-none"
-                  style={{ left: stagePreview.x, top: stagePreview.y, transform: `rotate(${stagePreview.direction - 90}deg)` }}
-                >
-                  {stageCostumeSrc ? <img src={stageCostumeSrc} alt={activeCostume?.name || 'Sprite'} className="w-[96px] h-[96px] object-contain" /> : '🐱'}
-                </div>
-              )}
+        {/* --- RIGHT: Stage + Sprite info + Sprite list --- */}
+        <div className="shrink-0 flex flex-col min-h-0 border-l border-[#e0e0e0]" style={{ width: 480 }}>
+          {/* Stage area with green flag / stop */}
+          <div className="bg-[#e8edf1] p-2">
+            {/* Green flag & stop controls */}
+            <div className="flex items-center gap-2 mb-2 px-1">
+              <button
+                onClick={runPreview}
+                disabled={isRunning || !vmReady}
+                className="w-9 h-9 rounded-md flex items-center justify-center hover:bg-[#d0f0d0] transition-colors"
+                title="Green Flag"
+              >
+                <Flag className="w-5 h-5 text-[#4caf50]" style={{ fill: '#4caf50' }} />
+              </button>
+              <button
+                onClick={handleVmStop}
+                className="w-9 h-9 rounded-md flex items-center justify-center hover:bg-[#fdd] transition-colors"
+                title="Stop"
+              >
+                <StopCircle className="w-5 h-5 text-[#ec5959]" style={{ fill: '#ec5959' }} />
+              </button>
+              <div className="flex-1" />
+              <button className="w-7 h-7 rounded flex items-center justify-center hover:bg-white/60" title="Fullscreen">
+                <Maximize2 className="w-4 h-4 text-[#575e75]" />
+              </button>
+            </div>
+            {/* Canvas */}
+            <div className="rounded-lg bg-white border border-[#d0d0d0] overflow-hidden" style={{ aspectRatio: '480/360' }}>
+              <canvas
+                ref={canvasRef}
+                width={480}
+                height={360}
+                className="w-full h-full"
+                style={{ imageRendering: 'pixelated' }}
+              />
             </div>
           </div>
 
-          <div className="border-t border-[#c8d0dd] min-h-0 grid grid-rows-[120px_1fr]">
-            <div className="p-2 bg-white border-b border-[#d7deeb]">
-              <div className="grid grid-cols-[68px_1fr] items-center gap-2 text-sm text-[#4f5f80]">
-                <div className="font-semibold">Sprite</div>
-                <input
-                  value={selectedTarget?.name || 'Sprite1'}
-                  onChange={(e) => {
-                    const nextName = e.target.value;
-                    updateProject((current) => ({
-                      ...current,
-                      targets: current.targets.map((target, idx) => idx === selectedTargetIndex ? { ...target, name: nextName } : target),
-                    }));
-                  }}
-                  className="h-8 rounded-full border border-[#c8d0dd] px-3"
-                />
+          {/* Sprite info pane */}
+          <div className="bg-white border-t border-b border-[#e0e0e0] px-3 py-2 shrink-0">
+            <div className="flex items-center gap-3 text-[13px] text-[#575e75]">
+              <span className="font-semibold text-[#575e75]">Sprite</span>
+              <input
+                value={selectedTarget?.name || 'Sprite1'}
+                onChange={(e) => {
+                  const nextName = e.target.value;
+                  updateProject((current) => ({
+                    ...current,
+                    targets: current.targets.map((target, idx) => idx === selectedTargetIndex ? { ...target, name: nextName } : target),
+                  }));
+                }}
+                className="h-7 rounded border border-[#d0d0d0] px-2 flex-1 text-[13px] min-w-0"
+              />
+              <div className="flex items-center gap-1 text-[12px]">
+                <span className="text-[#b5b5b5]">↔</span> x
+                <input className="w-10 h-7 rounded border border-[#d0d0d0] text-center text-[12px]" value={Math.round(stagePreview.x)} readOnly />
               </div>
-              <div className="mt-2 grid grid-cols-4 gap-2 text-xs">
-                <div className="rounded-full border border-[#c8d0dd] h-8 flex items-center justify-center gap-1">x <input className="w-8 bg-transparent text-center" value={Math.round((stagePreview.x - 180) / 0.7)} readOnly /></div>
-                <div className="rounded-full border border-[#c8d0dd] h-8 flex items-center justify-center gap-1">y <input className="w-8 bg-transparent text-center" value={Math.round((110 - stagePreview.y) / 0.6)} readOnly /></div>
-                <div className="rounded-full border border-[#c8d0dd] h-8 flex items-center justify-center gap-1">size <input className="w-10 bg-transparent text-center" value={Math.round(selectedTarget?.size as number || 100)} readOnly /></div>
-                <div className="rounded-full border border-[#c8d0dd] h-8 flex items-center justify-center gap-1">dir <input className="w-8 bg-transparent text-center" value={Math.round(stagePreview.direction || 90)} readOnly /></div>
+              <div className="flex items-center gap-1 text-[12px]">
+                <span className="text-[#b5b5b5]">↕</span> y
+                <input className="w-10 h-7 rounded border border-[#d0d0d0] text-center text-[12px]" value={Math.round(stagePreview.y)} readOnly />
               </div>
-              <div className="mt-2 flex items-center gap-2 text-xs">
-                <span>Show</span>
-                <button className="w-8 h-8 rounded border border-[#c8d0dd] flex items-center justify-center" onClick={() => setSpriteVisible(true)}><Eye className="w-4 h-4 text-[#6b5ce7]" /></button>
-                <button className="w-8 h-8 rounded border border-[#c8d0dd] flex items-center justify-center" onClick={() => setSpriteVisible(false)}><EyeOff className="w-4 h-4 text-[#6b5ce7]" /></button>
-                <button className="w-8 h-8 rounded border border-[#c8d0dd] flex items-center justify-center" onClick={() => setStagePreview((p) => ({ ...p, direction: p.direction - 15 }))}><RotateCcw className="w-4 h-4" /></button>
-                <button className="w-8 h-8 rounded border border-[#c8d0dd] flex items-center justify-center" onClick={() => setStagePreview((p) => ({ ...p, direction: p.direction + 15 }))}><RotateCw className="w-4 h-4" /></button>
+            </div>
+            <div className="flex items-center gap-3 mt-1.5 text-[12px] text-[#575e75]">
+              <div className="flex items-center gap-1">
+                Show
+                <button onClick={() => setSpriteVisible(true)} className={`w-6 h-6 rounded flex items-center justify-center ${spriteVisible ? 'bg-[#855cd6] text-white' : 'bg-[#f0f0f0]'}`}><Eye className="w-3 h-3" /></button>
+                <button onClick={() => setSpriteVisible(false)} className={`w-6 h-6 rounded flex items-center justify-center ${!spriteVisible ? 'bg-[#855cd6] text-white' : 'bg-[#f0f0f0]'}`}><EyeOff className="w-3 h-3" /></button>
+              </div>
+              <div className="flex items-center gap-1">
+                Size <input className="w-10 h-6 rounded border border-[#d0d0d0] text-center text-[11px]" value={Math.round(stagePreview.size || 100)} readOnly />
+              </div>
+              <div className="flex items-center gap-1">
+                Direction <input className="w-10 h-6 rounded border border-[#d0d0d0] text-center text-[11px]" value={Math.round(stagePreview.direction || 90)} readOnly />
+              </div>
+            </div>
+          </div>
+
+          {/* Sprite list + Stage/Backdrops tabs */}
+          <div className="flex-1 min-h-0 flex">
+            {/* Sprite list */}
+            <div className="flex-1 overflow-y-auto p-2 bg-[#f0f4f8]">
+              <div className="flex flex-wrap gap-2 content-start">
+                {spriteTargets.map((target, index) => {
+                  const mappedIndex = project.targets.findIndex((t) => t.name === target.name && !t.isStage);
+                  const selected = mappedIndex === selectedTargetIndex;
+                  const costumeSrc = target.costumes?.[0]?.md5ext && archive?.files?.[target.costumes[0].md5ext]
+                    ? `data:${imgMime(target.costumes[0].dataFormat)};base64,${archive.files[target.costumes[0].md5ext]}`
+                    : null;
+                  return (
+                    <button
+                      key={target.name + index}
+                      onClick={() => setSelectedTargetIndex(mappedIndex)}
+                      className={`w-[80px] rounded-lg border-2 p-1.5 flex flex-col items-center transition-colors ${
+                        selected ? 'border-[#855cd6] bg-[#ede7ff]' : 'border-[#d0d0d0] bg-white hover:border-[#b0b0b0]'
+                      }`}
+                    >
+                      <div className="w-14 h-14 rounded bg-[#f4f7ff] flex items-center justify-center overflow-hidden">
+                        {costumeSrc ? <img src={costumeSrc} alt={target.name} className="max-w-full max-h-full" /> : <span className="text-2xl">🐱</span>}
+                      </div>
+                      <div className="text-[10px] mt-1 text-[#575e75] truncate w-full text-center">{target.name}</div>
+                    </button>
+                  );
+                })}
+                <button onClick={addSprite} className="w-[80px] h-[90px] rounded-lg border-2 border-dashed border-[#b0b0b0] bg-white/60 flex items-center justify-center hover:border-[#855cd6] transition-colors">
+                  <Plus className="w-5 h-5 text-[#855cd6]" />
+                </button>
               </div>
             </div>
 
-            <div className="p-2 overflow-y-auto bg-[#dfe7f7] flex gap-2">
-              {spriteTargets.map((target, index) => {
-                const mappedIndex = project.targets.findIndex((t) => t.name === target.name && !t.isStage);
-                const selected = mappedIndex === selectedTargetIndex;
-                return (
+            {/* Stage / Backdrops panel */}
+            <div className="w-[120px] border-l border-[#e0e0e0] bg-white flex flex-col shrink-0 min-h-0">
+              <div className="px-2 pt-2 pb-1 flex items-center justify-between">
+                <div className="text-[11px] font-bold text-[#575e75]">Stage</div>
+                <div className="flex gap-1">
                   <button
-                    key={target.name + index}
-                    onClick={() => setSelectedTargetIndex(mappedIndex)}
-                    className={`w-[95px] h-[92px] rounded-xl border-2 flex flex-col items-center justify-center ${selected ? 'border-[#7b61ff] bg-[#ede7ff]' : 'border-[#b9c5dc] bg-white'}`}
+                    onClick={() => setLibraryOpen('backdrops')}
+                    className="w-5 h-5 rounded-full bg-[#4c97ff] text-white flex items-center justify-center hover:bg-[#3d79cc] text-[9px] font-bold"
+                    title="Choose backdrop"
                   >
-                    <div className="text-3xl">{target.costumes?.length ? '🎭' : '🐱'}</div>
-                    <div className="text-xs mt-1">{target.name}</div>
+                    🔍
                   </button>
-                );
-              })}
-              <button onClick={addSprite} className="w-[95px] h-[92px] rounded-xl border border-dashed border-[#9db0d3] bg-white/70 flex items-center justify-center">
-                <Plus className="w-5 h-5 text-[#6b7ea8]" />
-              </button>
+                  <button
+                    onClick={() => backdropInputRef.current?.click()}
+                    className="w-5 h-5 rounded-full bg-[#855cd6] text-white flex items-center justify-center hover:bg-[#7248bf]"
+                    title="Upload backdrop"
+                  >
+                    <Plus className="w-3 h-3" />
+                  </button>
+                </div>
+                <input ref={backdropInputRef} className="hidden" type="file" accept="image/*,.svg" onChange={(e) => e.target.files?.[0] && addBackdrop(e.target.files[0])} />
+              </div>
+              <div className="text-[9px] text-[#575e75] px-2 mb-1">Backdrops</div>
+              <div className="flex-1 overflow-y-auto px-1.5 pb-2 space-y-1.5">
+                {stageBackdrops.map((backdrop, idx) => {
+                  const src = archive?.files?.[backdrop.md5ext]
+                    ? `data:${imgMime(backdrop.dataFormat)};base64,${archive.files[backdrop.md5ext]}`
+                    : null;
+                  const selected = idx === stageCurrentBackdrop;
+                  return (
+                    <button
+                      key={backdrop.assetId}
+                      onClick={() => setStageBackdrop(idx)}
+                      className={`w-full rounded border-2 p-1 transition-colors ${selected ? 'border-[#855cd6] bg-[#f0ebff]' : 'border-[#d0d0d0] hover:border-[#b0b0b0]'}`}
+                    >
+                      <div className="w-full aspect-[4/3] rounded bg-[#f4f7ff] flex items-center justify-center overflow-hidden">
+                        {src ? <img src={src} alt={backdrop.name} className="max-w-full max-h-full" /> : <span className="text-xs text-[#b0b0b0]">🖼</span>}
+                      </div>
+                      <div className="text-[9px] text-[#575e75] mt-0.5 truncate text-center">{idx + 1}. {backdrop.name}</div>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </div>
         </div>
       </div>
 
-      <div className="h-[180px] border-t border-[#c8d0dd] bg-white p-2">
-        <div className="flex items-center justify-between mb-1">
-          <div className="text-xs font-semibold text-[#6a7b9a]">Raw project.json (compatibility view)</div>
-          <div className="flex items-center gap-2">
-            {vmError && <span className="text-[11px] text-red-500 max-w-[480px] truncate">VM error: {vmError}</span>}
-            <button onClick={applyJsonDraft} className="text-xs px-2 py-1 rounded border border-[#c8d0dd]">Apply</button>
+      {/* ===== JSON DEBUG (collapsible) ===== */}
+      {showJson && (
+        <div className="h-[160px] border-t border-[#d0d0d0] bg-[#fafafa] p-2 shrink-0">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-[11px] font-semibold text-[#575e75]">project.json</span>
+            <div className="flex items-center gap-2">
+              {vmError && <span className="text-[11px] text-red-500 max-w-[300px] truncate">⚠ {vmError}</span>}
+              <button onClick={applyJsonDraft} className="text-[11px] px-2 py-0.5 rounded bg-[#855cd6] text-white">Apply</button>
+            </div>
           </div>
-        </div>
-        <div className="relative h-[136px]">
           <textarea
-            className="w-full h-full border border-[#d4ddec] rounded bg-[#f9fbff] p-2 text-[11px] font-mono"
+            className="w-full h-[120px] border border-[#d0d0d0] rounded bg-white p-2 text-[11px] font-mono resize-none"
             value={projectJsonDraft || archive?.projectJson || formatJson(project)}
             onChange={(e) => setProjectJsonDraft(e.target.value)}
             spellCheck={false}
           />
-          <Search className="absolute right-2 top-2 w-3 h-3 text-[#8b95a8]" />
+          {jsonError && <div className="text-[11px] text-red-500 mt-0.5">{jsonError}</div>}
         </div>
-        {jsonError && <div className="text-[11px] text-red-500 mt-1">{jsonError}</div>}
-      </div>
+      )}
+
+      {/* Variable / List creation dialog */}
+      {dataPrompt && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setDataPrompt(null)}>
+          <div className="bg-white rounded-xl shadow-xl p-5 w-[320px]" onClick={(e) => e.stopPropagation()}>
+            <div className="text-[15px] font-bold text-[#575e75] mb-3">
+              {dataPrompt.type === 'variable' ? 'New Variable' : 'New List'}
+            </div>
+            <div className="text-[13px] text-[#575e75] mb-1">
+              {dataPrompt.type === 'variable' ? 'Variable' : 'List'} name:
+            </div>
+            <input
+              autoFocus
+              className="w-full h-9 rounded-lg border-2 border-[#855cd6] px-3 text-[14px] outline-none"
+              value={dataPrompt.name}
+              onChange={(e) => setDataPrompt({ ...dataPrompt, name: e.target.value })}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleDataPromptSubmit(); if (e.key === 'Escape') setDataPrompt(null); }}
+            />
+            <div className="flex justify-end gap-2 mt-4">
+              <button onClick={() => setDataPrompt(null)} className="px-4 py-1.5 rounded-lg text-[13px] text-[#575e75] border border-[#d0d0d0] hover:bg-[#f0f0f0]">Cancel</button>
+              <button onClick={handleDataPromptSubmit} className="px-4 py-1.5 rounded-lg text-[13px] text-white bg-[#855cd6] hover:bg-[#7248bf]">OK</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Asset Library Dialog */}
+      {libraryOpen && (
+        <ScratchLibraryDialog
+          mode={libraryOpen}
+          open={true}
+          onClose={() => setLibraryOpen(null)}
+          onSelect={addLibraryAsset}
+        />
+      )}
     </div>
   );
 };

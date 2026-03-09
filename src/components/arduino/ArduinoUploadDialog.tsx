@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { requestArduinoPort, requestAnyPort, SerialPortLike } from '@/services/serialUtils';
 import {
   Dialog,
   DialogContent,
@@ -33,11 +34,15 @@ export interface UploadConfig {
 interface ArduinoUploadDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onUpload: (config: UploadConfig, onProgress?: (message: string, percent?: number) => void) => Promise<void>;
+  onUpload: (config: UploadConfig, port: SerialPortLike, onProgress?: (message: string, percent?: number) => void) => Promise<void>;
   sketchCode: string;
 }
 
-const DFU_BOARDS = ['uno_r4_wifi'];
+const SAMBA_BOARDS = ['uno_r4_wifi', 'due', 'zero', 'mkr_wifi_1010', 'nano_33_iot'];
+const AVR109_BOARDS = ['leonardo', 'micro'];
+const ESP_BOARDS = ['esp32', 'esp8266'];
+const STM32_BOARDS = ['portenta_h7', 'giga_r1'];
+const UF2_ONLY_BOARDS = ['nano_33_ble', 'rp2040_connect'];
 
 export function ArduinoUploadDialog({
   open,
@@ -51,7 +56,7 @@ export function ArduinoUploadDialog({
     baudRate: 115200,
     uploadMethod: 'serial',
   });
-  const isDFUBoard = DFU_BOARDS.includes(config.boardId);
+  const isSambaBoard = SAMBA_BOARDS.includes(config.boardId);
   const isVerifiedBoard = isVerifiedWebFlashBoard(config.boardId);
 
   const [ports, setPorts] = useState<string[]>([]);
@@ -137,13 +142,28 @@ export function ArduinoUploadDialog({
     setProgressPercent(0);
 
     try {
-      await onUpload(config, (message, percent) => {
+      // CRITICAL: Request serial port HERE in the click handler (user gesture)
+      // so the browser allows the permission prompt.
+      let port: SerialPortLike;
+      if (config.uploadMethod === 'serial') {
+        const isEsp = ESP_BOARDS.includes(config.boardId);
+        port = isEsp ? await requestAnyPort() : await requestArduinoPort();
+      } else {
+        // WiFi/Bluetooth don't need a serial port
+        port = null as unknown as SerialPortLike;
+      }
+
+      await onUpload(config, port, (message, percent) => {
         setProgressLog(prev => [...prev, message]);
         if (percent !== undefined) setProgressPercent(percent);
       });
       onOpenChange(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Upload failed');
+      if (err instanceof DOMException && err.name === 'NotAllowedError') {
+        setError('Serial port access denied. Please select a port when prompted.');
+      } else {
+        setError(err instanceof Error ? err.message : 'Upload failed');
+      }
     } finally {
       setLoading(false);
     }
@@ -162,7 +182,7 @@ export function ArduinoUploadDialog({
           {isInIframe && (
             <div className="text-sm text-amber-500 bg-amber-500/10 p-3 rounded flex items-start gap-2">
               <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
-              <span>Board upload (Web Serial / WebUSB) does not work inside iframes due to browser security restrictions. Please open this app directly in a new tab to use hardware flashing.</span>
+              <span>Board upload (Web Serial) does not work inside iframes due to browser security restrictions. Please open this app directly in a new tab to use hardware flashing.</span>
             </div>
           )}
           <div>
@@ -196,21 +216,21 @@ export function ArduinoUploadDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="serial">{isDFUBoard ? 'USB (DFU)' : 'USB Serial'}</SelectItem>
-                <SelectItem value="wifi" disabled={!arduinoBoards[config.boardId]?.wifi || isDFUBoard}>
-                  WiFi (OTA){isDFUBoard ? ' — not available from web app' : (!arduinoBoards[config.boardId]?.wifi ? ' — unsupported' : '')}
+                <SelectItem value="serial">{isSambaBoard ? 'USB Serial (SAM-BA)' : 'USB Serial'}</SelectItem>
+                <SelectItem value="wifi" disabled={!arduinoBoards[config.boardId]?.wifi || isSambaBoard}>
+                  WiFi (OTA){isSambaBoard ? ' — not available from web app' : (!arduinoBoards[config.boardId]?.wifi ? ' — unsupported' : '')}
                 </SelectItem>
-                <SelectItem value="bluetooth" disabled={!arduinoBoards[config.boardId]?.bluetooth || isDFUBoard}>
-                  Bluetooth{isDFUBoard ? ' — not available from web app' : (!arduinoBoards[config.boardId]?.bluetooth ? ' — unsupported' : '')}
+                <SelectItem value="bluetooth" disabled={!arduinoBoards[config.boardId]?.bluetooth || isSambaBoard}>
+                  Bluetooth{isSambaBoard ? ' — not available from web app' : (!arduinoBoards[config.boardId]?.bluetooth ? ' — unsupported' : '')}
                 </SelectItem>
               </SelectContent>
             </Select>
-            {isDFUBoard && (config.uploadMethod === 'wifi' || config.uploadMethod === 'bluetooth') && (
+            {isSambaBoard && (config.uploadMethod === 'wifi' || config.uploadMethod === 'bluetooth') && (
               <p className="text-xs text-muted-foreground mt-1">OTA/Bluetooth uploads require local network access and are not possible from a hosted web app. Use Arduino IDE instead.</p>
             )}
           </div>
 
-          {config.uploadMethod === 'serial' && !isDFUBoard && (
+          {config.uploadMethod === 'serial' && !isSambaBoard && (
             <>
               <div>
                 <Label htmlFor="port">Serial Port</Label>
@@ -262,21 +282,48 @@ export function ArduinoUploadDialog({
             </>
           )}
 
-          {config.uploadMethod === 'serial' && isDFUBoard && (
+          {config.uploadMethod === 'serial' && isSambaBoard && (
             <div className="space-y-2">
               <div className="text-sm text-muted-foreground bg-muted/50 p-3 rounded space-y-2">
-                <p className="font-medium text-foreground">USB DFU Mode Required</p>
+                <p className="font-medium text-foreground">USB Serial Upload (SAM-BA Protocol)</p>
                 <ol className="list-decimal list-inside space-y-1 text-xs">
-                  <li>Connect your Uno R4 WiFi via USB-C</li>
-                  <li>Double-tap the reset button quickly — the LED should pulse</li>
-                  <li>Click "Upload Sketch" — you'll be prompted to select the USB device</li>
+                  <li>Connect your board via USB</li>
+                  <li>Click "Upload Sketch" — you'll be prompted to select the serial port</li>
+                  <li>The board will automatically enter bootloader mode (1200-baud reset)</li>
+                  <li>You may need to select the port again after the board resets</li>
                 </ol>
               </div>
-              <p className="text-xs text-muted-foreground">Uses WebUSB DFU protocol. No serial port selection needed.</p>
             </div>
           )}
 
-          {config.uploadMethod === 'wifi' && !isDFUBoard && (
+          {config.uploadMethod === 'serial' && AVR109_BOARDS.includes(config.boardId) && (
+            <div className="text-sm text-muted-foreground bg-muted/50 p-3 rounded space-y-2">
+              <p className="font-medium text-foreground">USB Serial Upload (Caterina/AVR109)</p>
+              <p className="text-xs">Connect via USB. The board will auto-reset into bootloader mode. You may need to select the port twice.</p>
+            </div>
+          )}
+
+          {config.uploadMethod === 'serial' && ESP_BOARDS.includes(config.boardId) && (
+            <div className="text-sm text-muted-foreground bg-muted/50 p-3 rounded space-y-2">
+              <p className="font-medium text-foreground">USB Serial Upload (esptool)</p>
+              <p className="text-xs">Connect via USB. If auto-reset doesn't work, hold the BOOT button while clicking Upload.</p>
+            </div>
+          )}
+
+          {config.uploadMethod === 'serial' && STM32_BOARDS.includes(config.boardId) && (
+            <div className="text-sm text-muted-foreground bg-muted/50 p-3 rounded space-y-2">
+              <p className="font-medium text-foreground">USB Serial Upload (STM32 Bootloader)</p>
+              <p className="text-xs">Connect via USB. The board will enter system bootloader mode via 1200-baud touch.</p>
+            </div>
+          )}
+
+          {UF2_ONLY_BOARDS.includes(config.boardId) && (
+            <div className="text-sm text-amber-500 bg-amber-500/10 p-2 rounded">
+              This board uses UF2 mass storage for flashing, which browsers cannot access. Use Arduino IDE or drag-and-drop the .uf2 file to the board's drive.
+            </div>
+          )}
+
+          {config.uploadMethod === 'wifi' && !isSambaBoard && (
             <div>
               <Label htmlFor="ipaddress">Board IP Address</Label>
               <Input
@@ -288,7 +335,7 @@ export function ArduinoUploadDialog({
             </div>
           )}
 
-          {config.uploadMethod === 'bluetooth' && !isDFUBoard && (
+          {config.uploadMethod === 'bluetooth' && !isSambaBoard && (
             <div>
               <Label htmlFor="btdevice">Bluetooth Device Name / MAC</Label>
               <Input
@@ -307,9 +354,9 @@ export function ArduinoUploadDialog({
           )}
 
 
-          {!isVerifiedBoard && (
+          {!isVerifiedBoard && !UF2_ONLY_BOARDS.includes(config.boardId) && (
             <div className="text-sm text-amber-500 whitespace-pre-wrap bg-amber-500/10 p-2 rounded">
-              This board is currently available for planning/simulation only. Web compile + flash is verified for Uno, Nano, Mega, Leonardo, Micro, and Uno R4 WiFi.
+              This board is currently available for planning/simulation only.
             </div>
           )}
 

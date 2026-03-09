@@ -1,5 +1,5 @@
 import { FileNode } from '@/types/ide';
-import { LanguageTemplate } from '@/components/ide/LanguagePicker';
+import { LanguageTemplate } from '@/data/templateRegistry';
 import { getArduinoTemplateFiles } from './arduinoTemplates';
 
 const tutorialTitles: Record<LanguageTemplate, string> = {
@@ -34,6 +34,10 @@ const tutorialTitles: Record<LanguageTemplate, string> = {
   sqlite: 'SQLite',
   arduino: 'Arduino',
   scratch: 'Scratch Blocks',
+  word: 'Word Document',
+  powerpoint: 'PowerPoint',
+  excel: 'Excel Spreadsheet',
+  video: 'Video Editor',
 };
 
 const cloneFileNodes = (nodes: FileNode[]): FileNode[] =>
@@ -194,6 +198,18 @@ export const getTemplateFiles = (template: LanguageTemplate): FileNode[] => {
       return withTutorialFolder(template, getArduinoTemplateFiles('uno'));
     case 'scratch':
       baseTemplate = scratchTemplate;
+      break;
+    case 'word':
+      baseTemplate = wordTemplate;
+      break;
+    case 'powerpoint':
+      baseTemplate = powerpointTemplate;
+      break;
+    case 'excel':
+      baseTemplate = excelTemplate;
+      break;
+    case 'video':
+      baseTemplate = videoTemplate;
       break;
     default:
       baseTemplate = htmlTemplate;
@@ -1916,6 +1932,150 @@ const blankTemplate: FileNode[] = [
 # the sidebar or drag and drop files here.
 #
 # Happy coding! 🚀`
+      }
+    ]
+  }
+];
+
+const wordTemplate: FileNode[] = [
+  {
+    id: 'root',
+    name: 'my-document',
+    type: 'folder',
+    children: [
+      {
+        id: 'document-docx',
+        name: 'Document.docx',
+        type: 'file',
+        language: 'docx',
+        content: ''
+      },
+      {
+        id: 'readme-md',
+        name: 'README.md',
+        type: 'file',
+        language: 'markdown',
+        content: `# Word Document Project
+
+This project contains a Word document. Click on \`Document.docx\` to open the Word-like editor.
+
+## Features
+- Rich text editing
+- Font and size selection
+- Bold, italic, underline formatting
+- Text alignment
+- Save to .docx format
+`
+      }
+    ]
+  }
+];
+
+const powerpointTemplate: FileNode[] = [
+  {
+    id: 'root',
+    name: 'my-presentation',
+    type: 'folder',
+    children: [
+      {
+        id: 'presentation-pptx',
+        name: 'Presentation.pptx',
+        type: 'file',
+        language: 'pptx',
+        content: ''
+      },
+      {
+        id: 'readme-md',
+        name: 'README.md',
+        type: 'file',
+        language: 'markdown',
+        content: `# PowerPoint Project
+
+This project contains a PowerPoint presentation. Click on \`Presentation.pptx\` to open the slide editor.
+
+## Features
+- Slide thumbnails panel
+- Click-to-edit text boxes
+- Add, delete, duplicate, reorder slides
+- Ribbon toolbar with formatting
+- Save to .pptx format
+`
+      }
+    ]
+  }
+];
+
+const excelTemplate: FileNode[] = [
+  {
+    id: 'root',
+    name: 'my-spreadsheet',
+    type: 'folder',
+    children: [
+      {
+        id: 'spreadsheet-xlsx',
+        name: 'Spreadsheet.xlsx',
+        type: 'file',
+        language: 'xlsx',
+        content: ''
+      },
+      {
+        id: 'readme-md',
+        name: 'README.md',
+        type: 'file',
+        language: 'markdown',
+        content: `# Excel Spreadsheet Project
+
+This project contains an Excel spreadsheet. Click on \`Spreadsheet.xlsx\` to open the spreadsheet editor.
+
+## Features
+- Full grid with 50 rows × 26 columns
+- Formula bar with cell reference
+- Keyboard navigation (arrows, Tab, Enter)
+- Double-click or type to edit cells
+- Sheet tabs
+- Save to .xlsx format
+`
+      }
+    ]
+  }
+];
+
+const videoTemplate: FileNode[] = [
+  {
+    id: 'video-project',
+    name: 'Video Project',
+    type: 'folder',
+    children: [
+      {
+        id: 'sample-video',
+        name: 'sample.mp4',
+        type: 'file',
+        language: 'video',
+        content: ''
+      },
+      {
+        id: 'readme-md',
+        name: 'README.md',
+        type: 'file',
+        language: 'markdown',
+        content: `# Video Editor Project
+
+This project contains a video editor. Upload \`.mp4\`, \`.webm\`, or \`.ogg\` files to get started.
+
+## Features
+- Play/pause, skip, fullscreen
+- Visual thumbnail timeline with scrubbing
+- Draggable trim handles (Set In/Out)
+- Playback speed control (0.5× – 2×)
+- Volume control with mute
+- Frame capture (download as PNG)
+- Video info panel (resolution, duration)
+
+## Getting Started
+1. Use "Upload Files" in the file tree to add a video
+2. Click the video file to open the editor
+3. Use the timeline to scrub and trim
+`
       }
     ]
   }

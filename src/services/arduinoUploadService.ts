@@ -2,27 +2,17 @@ import { UploadConfig } from '@/components/arduino/ArduinoUploadDialog';
 import { supabase } from '@/integrations/supabase/client';
 import { isVerifiedWebFlashBoard } from '@/data/arduinoTemplates';
 import { flashHex } from './stk500';
-import { requestDFUDevice, flashDFU } from './dfuFlash';
+import { triggerBootloader, flashViaSamba, isSambaBoard, SAMBA_BOARD_CONFIGS } from './sambaFlash';
+import { flashViaAVR109 } from './avr109';
+import { flashViaEsptool } from './esptool';
+import { flashViaSTM32 } from './stm32serial';
+import { SerialPortLike, getSerial, waitForNewPort } from './serialUtils';
 
-interface SerialPortLike {
-  open(options: { baudRate: number }): Promise<void>;
-  close(): Promise<void>;
-  getInfo(): { usbProductId?: number };
-  readable: ReadableStream<Uint8Array> | null;
-  writable: WritableStream<Uint8Array> | null;
-  setSignals?(signals: { dataTerminalReady?: boolean; requestToSend?: boolean }): Promise<void>;
-}
+// Board → flash protocol mapping
+const AVR109_BOARDS = ['leonardo', 'micro'];
+const ESP_BOARDS = ['esp32', 'esp8266'];
+const STM32_BOARDS = ['portenta_h7', 'giga_r1'];
 
-interface SerialLike {
-  requestPort(): Promise<SerialPortLike>;
-  getPorts(): Promise<SerialPortLike[]>;
-}
-
-const getSerial = (): SerialLike | undefined =>
-  (navigator as unknown as { serial?: SerialLike }).serial;
-
-// ARM-based boards that use DFU instead of STK500v1
-const DFU_BOARDS = ['uno_r4_wifi'];
 const OTA_BRIDGE_URL = import.meta.env.VITE_OTA_BRIDGE_URL || 'http://127.0.0.1:3232';
 const OTA_BRIDGE_TOKEN = import.meta.env.VITE_OTA_BRIDGE_TOKEN;
 const REQUEST_TIMEOUT_MS = 45000;
@@ -49,7 +39,7 @@ export class ArduinoUploadService {
     if (!isVerifiedWebFlashBoard(boardId)) {
       throw new Error(
         `Board "${boardId}" is currently in planning/simulation mode. ` +
-        'Verified web compile+flash support is available for Uno/Nano/Mega/Leonardo/Micro/Uno R4 WiFi. '
+        'Web compile+flash is not yet available for this board.'
       );
     }
   }
@@ -109,17 +99,17 @@ export class ArduinoUploadService {
     }
 
     const compileResult = await compileResponse.json();
-    const isDFU = DFU_BOARDS.includes(boardId);
+    const needsBinary = isSambaBoard(boardId) || ESP_BOARDS.includes(boardId) || STM32_BOARDS.includes(boardId);
 
-    if (isDFU) {
+    if (needsBinary) {
       if (!compileResult.binary) {
         throw new Error('Compilation did not produce binary output for this board');
       }
     } else if (!compileResult.hex) {
       if (compileResult.compiled && compileResult.asm) {
         throw new Error(
-          'Sketch compiled to assembly but binary output is not available from the compiler service. ' +
-          'This is a known limitation — try a simpler sketch or use Arduino IDE for full compilation.'
+          'Sketch compiled to assembly but binary output is not available. ' +
+          'Try a simpler sketch or use Arduino IDE.'
         );
       }
       throw new Error('Compilation did not produce flashable output');
@@ -142,7 +132,7 @@ export class ArduinoUploadService {
 
     const isLocalHostBridge = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?/i.test(OTA_BRIDGE_URL);
     if (!isLocalHostBridge && !OTA_BRIDGE_URL.startsWith('https://')) {
-      throw new Error('Remote OTA bridge must use HTTPS. Set VITE_OTA_BRIDGE_URL to an https:// endpoint.');
+      throw new Error('Remote OTA bridge must use HTTPS.');
     }
 
     const bridgeHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -159,13 +149,12 @@ export class ArduinoUploadService {
       }, 90000), 3);
     } catch {
       throw new Error(
-        `Could not reach local ${method.toUpperCase()} uploader at ${OTA_BRIDGE_URL}. ` +
-        'Start a local uploader service (same LAN/Bluetooth access as your board) or use Arduino IDE/CLI for production flashing.'
+        `Could not reach local ${method.toUpperCase()} uploader at ${OTA_BRIDGE_URL}.`
       );
     }
 
     if (!response.ok) {
-      const details = await response.text().catch(() => 'No additional details available');
+      const details = await response.text().catch(() => '');
       throw new Error(`${method.toUpperCase()} upload failed: ${details}`);
     }
 
@@ -173,68 +162,61 @@ export class ArduinoUploadService {
   }
 
   /**
-   * Compile sketch via backend edge function, then flash via appropriate protocol
+   * Determine flash protocol for a board
+   */
+  static getFlashProtocol(boardId: string): 'stk500' | 'avr109' | 'samba' | 'esptool' | 'stm32' {
+    if (AVR109_BOARDS.includes(boardId)) return 'avr109';
+    if (isSambaBoard(boardId)) return 'samba';
+    if (ESP_BOARDS.includes(boardId)) return 'esptool';
+    if (STM32_BOARDS.includes(boardId)) return 'stm32';
+    return 'stk500';
+  }
+
+  /**
+   * Compile + flash via serial.
+   * The port MUST be pre-acquired in a user gesture context (click handler).
    */
   static async uploadViaSerial(
     sketch: string,
     config: UploadConfig,
+    port: SerialPortLike,
     onProgress?: (message: string, percent?: number) => void
   ): Promise<void> {
-    const isDFU = DFU_BOARDS.includes(config.boardId);
+    const protocol = this.getFlashProtocol(config.boardId);
     const compileResult = await this.compileSketch(sketch, config.boardId, onProgress);
 
-    // Stage 2: Flash
-    if (isDFU) {
-      await this.flashViaDFU(compileResult.binary!, onProgress);
-    } else {
-      await this.flashViaSTK500(compileResult.hex!, config, onProgress);
-    }
-  }
+    switch (protocol) {
+      case 'avr109':
+        await flashViaAVR109(compileResult.hex!, port, onProgress);
+        break;
 
-  /**
-   * Flash via WebUSB DFU for ARM-based boards (Uno R4 WiFi)
-   */
-  private static async flashViaDFU(
-    binaryBase64: string,
-    onProgress?: (message: string, percent?: number) => void
-  ): Promise<void> {
-    if (!navigator.usb) {
-      throw new Error('WebUSB API not supported. Use Chrome or Edge.');
-    }
-
-    onProgress?.('Put your board in DFU mode (double-tap reset button), then select it...', 18);
-
-    let device: USBDevice;
-    try {
-      device = await requestDFUDevice();
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'NotFoundError') {
-        throw new Error(
-          'No DFU device found. Make sure your Arduino Uno R4 WiFi is in DFU mode:\n' +
-          '1. Double-tap the reset button quickly\n' +
-          '2. The LED should pulse/fade\n' +
-          '3. Try selecting the device again'
-        );
+      case 'samba': {
+        // Use the pre-acquired port for 1200-baud touch
+        await triggerBootloader(port, (msg, pct) => onProgress?.(msg, pct));
+        // After bootloader trigger, find the re-enumerated port via getPorts()
+        const serial = getSerial()!;
+        const existingPorts = await serial.getPorts();
+        const bootPort = existingPorts.length > 0
+          ? existingPorts[existingPorts.length - 1]
+          : port;
+        await flashViaSamba(compileResult.binary!, bootPort, (msg, pct) => onProgress?.(msg, pct), config.boardId);
+        break;
       }
-      throw err;
-    }
 
-    // Decode base64 binary to Uint8Array
-    const binaryStr = atob(binaryBase64);
-    const firmware = new Uint8Array(binaryStr.length);
-    for (let i = 0; i < binaryStr.length; i++) {
-      firmware[i] = binaryStr.charCodeAt(i);
-    }
+      case 'esptool': {
+        const chipHint = config.boardId === 'esp8266' ? 'esp8266' : 'esp32';
+        await flashViaEsptool(compileResult.binary!, port, chipHint, onProgress);
+        break;
+      }
 
-    try {
-      await flashDFU(device, firmware, (msg, pct) => {
-        onProgress?.(msg, pct);
-      });
-    } catch (err) {
-      throw new Error(
-        `DFU flash failed: ${err instanceof Error ? err.message : 'Unknown error'}\n` +
-        'Try double-tapping reset and retrying.'
-      );
+      case 'stm32':
+        await flashViaSTM32(compileResult.binary!, port, onProgress);
+        break;
+
+      case 'stk500':
+      default:
+        await this.flashViaSTK500(compileResult.hex!, port, config, onProgress);
+        break;
     }
   }
 
@@ -243,25 +225,11 @@ export class ArduinoUploadService {
    */
   private static async flashViaSTK500(
     hexData: string,
+    port: SerialPortLike,
     config: UploadConfig,
     onProgress?: (message: string, percent?: number) => void
   ): Promise<void> {
-    const serial = getSerial();
-    if (!serial) {
-      throw new Error('Web Serial API not supported. Use Chrome or Edge.');
-    }
-
-    onProgress?.('Requesting serial port access...', 18);
-
-    let port: SerialPortLike;
-    try {
-      port = await serial.requestPort();
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'NotAllowedError') {
-        throw new Error('Serial port access denied. Please select a port when prompted.');
-      }
-      throw err;
-    }
+    onProgress?.('Opening serial port...', 18);
 
     try {
       await port.open({ baudRate: config.baudRate || 115200 });
@@ -279,7 +247,6 @@ export class ArduinoUploadService {
       );
     }
   }
-
 
   static async uploadViaWiFi(
     sketch: string,
@@ -319,24 +286,17 @@ export class ArduinoUploadService {
     );
   }
 
-
   /**
    * Open serial monitor for debugging
    */
   static async openSerialMonitor(
-    _port: string,
+    port: SerialPortLike,
     baudRate: number,
     onData?: (data: string) => void
   ): Promise<() => Promise<void>> {
-    const serial = getSerial();
-    if (!serial) {
-      throw new Error('Web Serial API not supported');
-    }
+    await port.open({ baudRate });
 
-    const serialPort = await serial.requestPort();
-    await serialPort.open({ baudRate });
-
-    const reader = serialPort.readable?.getReader();
+    const reader = port.readable?.getReader();
     if (!reader) throw new Error('Could not get port reader');
 
     const decoder = new TextDecoder();
@@ -348,16 +308,14 @@ export class ArduinoUploadService {
         while (running) {
           const { value, done } = await reader.read();
           if (done) break;
-
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
-
           lines.forEach((line) => onData?.(line));
         }
       } finally {
         reader.releaseLock();
-        await serialPort.close();
+        await port.close();
       }
     })();
 
@@ -365,7 +323,7 @@ export class ArduinoUploadService {
       running = false;
       try {
         reader.releaseLock();
-        await serialPort.close();
+        await port.close();
       } catch { /* ignore */ }
     };
   }

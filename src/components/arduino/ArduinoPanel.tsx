@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { ArduinoUploadService } from '@/services/arduinoUploadService';
 import { BreadboardVisualizer } from './BreadboardVisualizer';
 import { LibraryManager } from './LibraryManager';
 import { ArduinoUploadDialog, UploadConfig } from './ArduinoUploadDialog';
@@ -161,8 +162,7 @@ export function ArduinoPanel({ files, onFileUpdate, onAddFile, currentTemplate }
       <ArduinoUploadDialog
         open={uploadDialogOpen}
         onOpenChange={setUploadDialogOpen}
-        onUpload={async (config: UploadConfig, onProgress?: (message: string, percent?: number) => void) => {
-          const { ArduinoUploadService } = await import('@/services/arduinoUploadService');
+        onUpload={async (config: UploadConfig, port, onProgress?: (message: string, percent?: number) => void) => {
           if (config.uploadMethod === 'wifi') {
             await ArduinoUploadService.uploadViaWiFi(getSketchWithLibraries(), config, onProgress);
             return;
@@ -171,7 +171,7 @@ export function ArduinoPanel({ files, onFileUpdate, onAddFile, currentTemplate }
             await ArduinoUploadService.uploadViaBluetooth(getSketchWithLibraries(), config, onProgress);
             return;
           }
-          await ArduinoUploadService.uploadViaSerial(getSketchWithLibraries(), config, onProgress);
+          await ArduinoUploadService.uploadViaSerial(getSketchWithLibraries(), config, port, onProgress);
         }}
         sketchCode={getSketchWithLibraries()}
       />
