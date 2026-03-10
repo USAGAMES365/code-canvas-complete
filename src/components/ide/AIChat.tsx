@@ -15,7 +15,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useAgentChat } from '@/hooks/useAgentChat';
 import { AgentMessage, AgentStep, CodeChange, WorkflowAction, GeneratedImage, GeneratedAudio, AIModel, InteractiveQuestion } from '@/types/agent';
 import { useApiKeys, PROVIDER_MODELS, PROVIDER_INFO } from '@/hooks/useApiKeys';
-import { ApiKeysDialog } from './ApiKeysDialog';
+import { SettingsDialog } from './SettingsDialog';
 import { getDiffLines } from '@/lib/diffUtils';
 import { useAttachments, ChatAttachment } from '@/hooks/useAttachments';
 import { ChatWidgetRenderer } from './ChatWidgets';
@@ -859,7 +859,10 @@ export const AIChat = ({
   if (!isOpen) return null;
 
   return (
-    <div className="h-full flex flex-col bg-card border-l border-border relative" style={{ width: panelWidth }}>
+    <div
+      className="h-full flex flex-col bg-card border-l border-border relative"
+      style={{ width: window.innerWidth < 768 ? '100%' : panelWidth }}
+    >
       {/* Resize handle */}
       <div
         onMouseDown={handleResizeMouseDown}
@@ -904,10 +907,10 @@ export const AIChat = ({
 
       {/* Removed - model selector moved to input area */}
       
-      <ApiKeysDialog open={showApiKeys} onOpenChange={(open) => {
+      <SettingsDialog open={showApiKeys} onOpenChange={(open) => {
         setShowApiKeys(open);
         if (!open) refetchApiKeys();
-      }} />
+      }} defaultTab="ai" />
 
       {/* Current file indicator */}
       {currentFile && (
