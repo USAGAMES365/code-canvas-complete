@@ -44,6 +44,8 @@ export const ExcelEditor = ({ file, onContentChange }: ExcelEditorProps) => {
   const [colWidths] = useState<number[]>(Array(DEFAULT_COLS).fill(80));
   const [ribbonTab, setRibbonTab] = useState<'home' | 'insert' | 'formulas' | 'data' | 'review' | 'view'>('home');
   const gridRef = useRef<HTMLDivElement>(null);
+  // Track last saved ZIP bytes so save() doesn't read stale file.content
+  const lastZipBytesRef = useRef<Uint8Array | null>(null);
 
   useEffect(() => {
     const load = async () => {
@@ -55,6 +57,7 @@ export const ExcelEditor = ({ file, onContentChange }: ExcelEditorProps) => {
           bytes = await buildNewXlsx();
           onContentChange(file.id, encodeDataUrl('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', bytes));
         }
+        lastZipBytesRef.current = bytes;
         const zip = await JSZip.loadAsync(bytes);
         const sharedStringsXml = await zip.file('xl/sharedStrings.xml')?.async('string');
         const sheetXml = await zip.file('xl/worksheets/sheet1.xml')?.async('string');
@@ -89,15 +92,16 @@ export const ExcelEditor = ({ file, onContentChange }: ExcelEditorProps) => {
       }
     };
     load();
-  }, [file.id, file.content, onContentChange]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file.id]); // Only reload when file ID changes
 
   useEffect(() => {
     setFormulaBarValue(grid[selectedCell[0]]?.[selectedCell[1]] || '');
   }, [selectedCell, grid]);
 
   const save = useCallback(async () => {
-    const bytes = decodeDataUrl(file.content || '') || (await buildNewXlsx());
-    const zip = await JSZip.loadAsync(bytes);
+    const baseBytes = lastZipBytesRef.current || (await buildNewXlsx());
+    const zip = await JSZip.loadAsync(baseBytes);
 
     const sharedValues = grid.flat().filter(v => v.length > 0);
     const uniqueShared = Array.from(new Set(sharedValues));
@@ -124,9 +128,28 @@ export const ExcelEditor = ({ file, onContentChange }: ExcelEditorProps) => {
     zip.file('xl/worksheets/sheet1.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${rowsXml}</sheetData></worksheet>`);
 
+    // Ensure workbook relationships include sharedStrings
+    zip.folder('xl')?.folder('_rels')?.file('workbook.xml.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>`);
+
     const out = new Uint8Array(await zip.generateAsync({ type: 'uint8array' }));
+    lastZipBytesRef.current = out;
     onContentChange(file.id, encodeDataUrl('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', out));
-  }, [file, grid, onContentChange]);
+  }, [file.id, grid, onContentChange]);
+
+  // Auto-save when grid changes
+  const initialLoadDone = useRef(false);
+  useEffect(() => {
+    if (loading || grid.length === 0) return;
+    if (!initialLoadDone.current) {
+      initialLoadDone.current = true;
+      return;
+    }
+    const timer = setTimeout(() => {
+      save();
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [grid, loading, save]);
 
   const updateCell = (row: number, col: number, value: string) => {
     setGrid(prev => {
