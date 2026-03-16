@@ -7,58 +7,7 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-const AGENT_SYSTEM_PROMPT = `You are an AI coding assistant in an online IDE. Shell/bash/javascript commands run in browser-native WebContainers (Node.js via jsh/node) by default, while other languages run through the existing execute-code backend (Wandbox or optional container runner). .replit and nix files do nothing in Code Canvas Complete.
-
-CRITICAL: NEVER suggest the user switch to another IDE (Replit, CodeSandbox, StackBlitz, VS Code, etc.). Code Canvas Complete is fully capable. If a user asks about Node.js or runtime features, help them use what's available here instead of redirecting them elsewhere.
-
-## RULES
-- NEVER ask questions in plain text. ALWAYS use <ask_prompt> tags (see below).
-- Use widgets sparingly: do NOT spam widgets. At most 1-2 widgets in a single response, and only when they add clear value.
-- Think step-by-step in <thinking_process> blocks for complex requests.
-- Propose code changes via <code_change> or <code_diff> blocks.
-
-## INTERACTIVE QUESTIONS
-Instead of typing a question, use one of these.
-- Supported types: text, multiple_choice, ranking, slider, yes_no, number, date, time, datetime, email.
-- If you need a yes/no response, prefer \`type="yes_no"\`.
-- For one-choice pickers, use \`multiple_choice\` without \`multi="true"\`.
-
-<ask_prompt type="text" question="What should the file be named?" />
-<ask_prompt type="multiple_choice" question="Which framework?" options="React,Vue,Angular,Svelte" />
-<ask_prompt type="multiple_choice" question="Select features:" options="Auth,DB,Storage" multi="true" />
-<ask_prompt type="ranking" question="Rank priorities:" options="Speed,Security,Readability" />
-<ask_prompt type="slider" question="Complexity level?" min="1" max="10" minLabel="Simple" maxLabel="Complex" />
-<ask_prompt type="yes_no" question="Should I create a config file for you?" />
-<ask_prompt type="number" question="How many items should I generate?" min="1" max="20" step="1" />
-<ask_prompt type="date" question="What deadline should I target?" />
-<ask_prompt type="time" question="What time should I schedule it for?" />
-<ask_prompt type="datetime" question="When should this run?" />
-<ask_prompt type="email" question="What email should receive updates?" placeholder="name@example.com" />
-
-## INLINE WIDGETS — use contextually
-
-| Tag | When to use |
-|-----|------------|
-| \`<color_picker default="#hex" />\` | CSS color discussions |
-| \`<coin_flip />\` or \`<coin_flip result="heads" />\` | Random yes/no, can be rigged |
-| \`<dice_roll />\` or \`<dice_roll sides="20" />\` | Random number picks |
-| \`<calculator />\` | Math discussions |
-| \`<spinner sections="A,B,C" colors="#e11,#38f,#2c5" />\` | Fun decision making |
-| \`<stock symbol="AAPL" />\` | Finance/stock discussions |
-| \`<change_template template="python" />\` | Switching project language |
-| \`<pomodoro duration="25" />\` | Focus/pair-programming timer |
-| \`<show_project_stats />\` | Project metrics overview |
-| \`<start_review />\` | Code review requests |
-| \`<visualize_logic />\` | Algorithm flowcharts (use Mermaid) |
-| \`<search_assets query="icon" />\` | Finding icons/assets |
-| \`<preview_viewport size="mobile" />\` | Responsive checks |
-| \`<run_a11y_check />\` | Accessibility audit |
-| \`<add_todo task="Fix bug" />\` | Task tracking |
-| \`<generate_readme />\` | README generation |
-| \`<generate_tests file="app.ts" />\` | Test generation |
-
-Available templates: blank, html, javascript, typescript, python, java, cpp, c, go, rust, ruby, php, csharp, bash, react, lua, nodejs, D, arduino
-
+const ARDUINO_SECTION = `
 ## ARDUINO & BREADBOARD CAD
 When the user is working with the Arduino template, they have access to a visual breadboard circuit designer. You can **generate circuit.json files directly** to build breadboards programmatically.
 
@@ -166,6 +115,67 @@ Place components on a 15px snap grid. The canvas breadboard area starts around x
 \`\`\`
 
 When asked to "build a circuit" or "create a breadboard", ALWAYS generate a complete circuit.json using \`<code_change file="circuit.json" lang="json" desc="...">\` along with the matching sketch.ino code. Generate unique IDs for components (e.g. "led-1", "r-1") and wires (e.g. "w-1", "w-2"). Space components apart to avoid overlap.
+`;
+
+const AGENT_SYSTEM_PROMPT_BASE = `You are an AI coding assistant in an online IDE. Shell/bash/javascript commands run in browser-native WebContainers (Node.js via jsh/node) by default, while other languages run through the existing execute-code backend (Wandbox or optional container runner). .replit and nix files do nothing in Code Canvas Complete.
+
+CRITICAL: NEVER suggest the user switch to another IDE (Replit, CodeSandbox, StackBlitz, VS Code, etc.). Code Canvas Complete is fully capable. If a user asks about Node.js or runtime features, help them use what's available here instead of redirecting them elsewhere.
+
+## RULES
+- Use widgets sparingly: do NOT spam widgets. At most 1-2 widgets in a single response, and only when they add clear value.
+- Think step-by-step in <thinking_process> blocks for complex requests.
+- Propose code changes via <code_change> or <code_diff> blocks.
+
+## INTERACTIVE QUESTIONS
+Instead of typing a question, use one of these.
+- Supported types: text, multiple_choice, ranking, slider, yes_no, number, date, time, datetime, email.
+- For one-choice pickers, use \`multiple_choice\` without \`multi="true"\`.
+
+<ask_prompt type="text" question="What should the file be named?" />
+<ask_prompt type="multiple_choice" question="Which framework?" options="React,Vue,Angular,Svelte" />
+<ask_prompt type="multiple_choice" question="Select features:" options="Auth,DB,Storage" multi="true" />
+<ask_prompt type="ranking" question="Rank priorities:" options="Speed,Security,Readability" />
+<ask_prompt type="slider" question="Complexity level?" min="1" max="10" minLabel="Simple" maxLabel="Complex" />
+<ask_prompt type="yes_no" question="Should I create a config file for you?" />
+<ask_prompt type="number" question="How many items should I generate?" min="1" max="20" step="1" />
+<ask_prompt type="date" question="What deadline should I target?" />
+<ask_prompt type="time" question="What time should I schedule it for?" />
+<ask_prompt type="datetime" question="When should this run?" />
+<ask_prompt type="email" question="What email should receive updates?" placeholder="name@example.com" />
+
+## INLINE WIDGETS — use contextually
+
+| Tag | When to use |
+|-----|------------|
+| \`<color_picker default="#hex" />\` | CSS color discussions |
+| \`<coin_flip />\` or \`<coin_flip result="heads" />\` | Random yes/no, can be rigged |
+| \`<dice_roll />\` or \`<dice_roll sides="20" />\` | Random number picks |
+| \`<calculator />\` | Math discussions |
+| \`<spinner sections="A,B,C" colors="#e11,#38f,#2c5" />\` | Fun decision making |
+| \`<stock symbol="AAPL" />\` | Finance/stock discussions |
+| \`<change_template template="python" />\` | Switching project language |
+| \`<pomodoro duration="25" />\` | Focus/pair-programming timer |
+| \`<show_project_stats />\` | Project metrics overview |
+| \`<start_review />\` | Code review requests |
+| \`<visualize_logic />\` | Algorithm flowcharts (use Mermaid) |
+| \`<search_assets query="icon" />\` | Finding icons/assets |
+| \`<preview_viewport size="mobile" />\` | Responsive checks |
+| \`<run_a11y_check />\` | Accessibility audit |
+| \`<add_todo task="Fix bug" />\` | Task tracking |
+| \`<generate_readme />\` | README generation |
+| \`<generate_tests file="app.ts" />\` | Test generation |
+| \`<docs_link slug="welcome" title="Welcome to CodeCanvas" />\` | Link user to a docs page — use when answering questions about how the IDE works |
+| \`<countdown seconds="60" label="Deploy timer" />\` | Countdown timer for any timed task |
+| \`<password_generator length="16" />\` | Generate a secure random password |
+| \`<unit_converter />\` | Unit conversion (px↔rem, colors, etc.) |
+| \`<progress_tracker steps="Design,Code,Test,Deploy" current="1" />\` | Visual step progress |
+| \`<json_viewer />\` | Pretty-print a JSON payload |
+| \`<regex_tester />\` | Test regex patterns live |
+
+Available templates: blank, html, javascript, typescript, python, java, cpp, c, go, rust, ruby, php, csharp, bash, react, lua, nodejs, D, arduino
+
+## DOCUMENTATION SEARCH
+The IDE has a built-in docs hub at \`/docs\`. When users ask how-to questions about CodeCanvas features, you should link them to the relevant docs page using the \`<docs_link>\` widget. Available docs pages cover topics like: getting started, account basics, AI workflows, templates, collaboration, Git, debugging, keyboard shortcuts, themes, deployment, and more. Use slug identifiers from the docs system.
 
 ## CODE CHANGES
 
@@ -196,6 +206,14 @@ When MCP servers are configured, you can call them using the \`mcp_call\` tool. 
 Users can attach images, PDFs, videos, and audio. Analyze them thoroughly when provided.
 
 ## Current Context`;
+
+function buildSystemPrompt(template?: string): string {
+  let prompt = AGENT_SYSTEM_PROMPT_BASE;
+  if (template === 'arduino') {
+    prompt = prompt.replace('## CODE CHANGES', ARDUINO_SECTION + '\n## CODE CHANGES');
+  }
+  return prompt;
+}
 
 const BASE_TOOLS = [
   {
@@ -232,7 +250,8 @@ function buildMCPTool(mcpServers: any[]): any {
           },
           method: {
             type: "string",
-            description: "The JSON-RPC method to call, e.g. 'tools/list', 'tools/call', 'resources/list', 'resources/read', 'prompts/list', 'prompts/get'",
+            description:
+              "The JSON-RPC method to call, e.g. 'tools/list', 'tools/call', 'resources/list', 'resources/read', 'prompts/list', 'prompts/get'",
           },
           params: {
             type: "object",
@@ -297,21 +316,18 @@ async function executeWebSearch(query: string, apiKey: string): Promise<string> 
   }
 }
 
-async function executeMCPCall(
-  serverName: string,
-  method: string,
-  params: any,
-  mcpServers: any[],
-): Promise<string> {
+async function executeMCPCall(serverName: string, method: string, params: any, mcpServers: any[]): Promise<string> {
   const server = mcpServers.find((s: any) => s.name.toLowerCase() === serverName.toLowerCase());
   if (!server) {
-    return JSON.stringify({ error: `MCP server "${serverName}" not found. Available: ${mcpServers.map((s: any) => s.name).join(", ")}` });
+    return JSON.stringify({
+      error: `MCP server "${serverName}" not found. Available: ${mcpServers.map((s: any) => s.name).join(", ")}`,
+    });
   }
 
   try {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      "Accept": "application/json, text/event-stream",
+      Accept: "application/json, text/event-stream",
     };
     if (server.api_key) {
       headers["Authorization"] = `Bearer ${server.api_key}`;
@@ -339,7 +355,7 @@ async function executeMCPCall(
     }
 
     const contentType = resp.headers.get("content-type") || "";
-    
+
     if (contentType.includes("text/event-stream")) {
       // Handle SSE responses - collect all data events
       const text = await resp.text();
@@ -348,7 +364,9 @@ async function executeMCPCall(
         if (line.startsWith("data: ") && line !== "data: [DONE]") {
           try {
             results.push(JSON.parse(line.slice(6)));
-          } catch { /* skip */ }
+          } catch {
+            /* skip */
+          }
         }
       }
       return JSON.stringify(results.length === 1 ? results[0] : results);
@@ -472,10 +490,22 @@ serve(async (req) => {
     }
 
     const userId = claimsData.claims.sub;
-    const { 
-      messages, currentFile, consoleErrors, workflows, agentMode, model, byokProvider, byokModel,
-      temperature: reqTemperature, maxTokens: reqMaxTokens, thinkingBudget: reqThinkingBudget,
-      enableWebSearch, enableCodeExecution, enableMCP,
+    const {
+      messages,
+      currentFile,
+      consoleErrors,
+      workflows,
+      agentMode,
+      model,
+      byokProvider,
+      byokModel,
+      temperature: reqTemperature,
+      maxTokens: reqMaxTokens,
+      thinkingBudget: reqThinkingBudget,
+      enableWebSearch,
+      enableCodeExecution,
+      enableMCP,
+      template,
     } = await req.json();
 
     // Check if user has a custom API key for the selected BYOK provider
@@ -565,8 +595,16 @@ serve(async (req) => {
     // Fetch user's enabled MCP servers and agent skills
     const serviceSupabaseForContext = supabaseServiceKey ? createClient(supabaseUrl, supabaseServiceKey) : supabase;
     const [{ data: mcpServers }, { data: agentSkills }] = await Promise.all([
-      serviceSupabaseForContext.from("mcp_servers").select("name, url, description, api_key, is_enabled").eq("user_id", userId).eq("is_enabled", true),
-      serviceSupabaseForContext.from("agent_skills").select("name, description, instruction, is_enabled").eq("user_id", userId).eq("is_enabled", true),
+      serviceSupabaseForContext
+        .from("mcp_servers")
+        .select("name, url, description, api_key, is_enabled")
+        .eq("user_id", userId)
+        .eq("is_enabled", true),
+      serviceSupabaseForContext
+        .from("agent_skills")
+        .select("name, description, instruction, is_enabled")
+        .eq("user_id", userId)
+        .eq("is_enabled", true),
     ]);
 
     // Build tools list based on toggles (default to enabled if not specified)
@@ -578,7 +616,7 @@ serve(async (req) => {
     if (enableMCP !== false && enabledMCPServers.length > 0) {
       tools.push(buildMCPTool(enabledMCPServers));
     }
-    
+
     // Build provider options from request params
     const providerOptions = {
       temperature: reqTemperature,
@@ -607,7 +645,7 @@ serve(async (req) => {
     }
 
     const systemPrompt = agentMode
-      ? AGENT_SYSTEM_PROMPT + "\n" + contextSection
+      ? buildSystemPrompt(template) + "\n" + contextSection
       : `You are a helpful AI coding assistant in Code Canvas Complete. This IDE runs code through Wandbox. .replit files do nothing here.\n\nCRITICAL: NEVER suggest the user switch to another IDE (Replit, CodeSandbox, StackBlitz, VS Code, etc.). Code Canvas Complete is fully capable.\n\n${contextSection}`;
 
     const aiMessages = [{ role: "system", content: systemPrompt }, ...messages];
@@ -620,7 +658,9 @@ serve(async (req) => {
         let args: any = {};
         try {
           args = JSON.parse(call.function.arguments || "{}");
-        } catch { /* empty */ }
+        } catch {
+          /* empty */
+        }
 
         let result = "";
         if (fnName === "web_search") {
@@ -649,10 +689,14 @@ serve(async (req) => {
       try {
         // Use non-streaming tool loop, then stream final response
         const conversation: any[] = [...aiMessages];
-        
+
         for (let i = 0; i < 4; i++) {
           const byokResponse = await callBYOKProvider(
-            selectedProvider, userApiKey, conversation, false, effectiveByokModel,
+            selectedProvider,
+            userApiKey,
+            conversation,
+            false,
+            effectiveByokModel,
             tools.length > 0 ? tools : undefined,
             providerOptions,
           );
@@ -661,19 +705,25 @@ serve(async (req) => {
             const errText = await byokResponse.text();
             console.error(`BYOK error (${selectedProvider}):`, byokResponse.status, errText);
             return new Response(
-              JSON.stringify({ error: `${selectedProvider} API error (${byokResponse.status}): ${errText.slice(0, 200)}` }),
+              JSON.stringify({
+                error: `${selectedProvider} API error (${byokResponse.status}): ${errText.slice(0, 200)}`,
+              }),
               { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } },
             );
           }
 
           let assistantMessage: any;
-          
+
           if (selectedProvider === "anthropic") {
             // Parse Anthropic response format
             const data = await byokResponse.json();
-            const textContent = data.content?.filter((b: any) => b.type === "text").map((b: any) => b.text).join("") || "";
+            const textContent =
+              data.content
+                ?.filter((b: any) => b.type === "text")
+                .map((b: any) => b.text)
+                .join("") || "";
             const toolUseBlocks = data.content?.filter((b: any) => b.type === "tool_use") || [];
-            
+
             if (toolUseBlocks.length === 0) {
               // No tool calls, stream the final response
               const encoder = new TextEncoder();
@@ -696,9 +746,17 @@ serve(async (req) => {
                 const key = Deno.env.get("LOVABLE_API_KEY") || "";
                 result = tu.input?.query ? await executeWebSearch(tu.input.query, key) : "Search failed.";
               } else if (tu.name === "mcp_call") {
-                result = await executeMCPCall(tu.input?.server_name || "", tu.input?.method || "", tu.input?.params, enabledMCPServers);
+                result = await executeMCPCall(
+                  tu.input?.server_name || "",
+                  tu.input?.method || "",
+                  tu.input?.params,
+                  enabledMCPServers,
+                );
               }
-              conversation.push({ role: "user", content: [{ type: "tool_result", tool_use_id: tu.id, content: result }] });
+              conversation.push({
+                role: "user",
+                content: [{ type: "tool_result", tool_use_id: tu.id, content: result }],
+              });
             }
             continue;
           }
@@ -710,7 +768,11 @@ serve(async (req) => {
             const encoder = new TextEncoder();
             const stream = new ReadableStream({
               start(controller) {
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "I could not produce a response." } }] })}\n\n`));
+                controller.enqueue(
+                  encoder.encode(
+                    `data: ${JSON.stringify({ choices: [{ delta: { content: "I could not produce a response." } }] })}\n\n`,
+                  ),
+                );
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
                 controller.close();
               },
@@ -745,7 +807,11 @@ serve(async (req) => {
         const encoder = new TextEncoder();
         const stream = new ReadableStream({
           start(controller) {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "Tool call loop exhausted. Please try again." } }] })}\n\n`));
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({ choices: [{ delta: { content: "Tool call loop exhausted. Please try again." } }] })}\n\n`,
+              ),
+            );
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
             controller.close();
           },
