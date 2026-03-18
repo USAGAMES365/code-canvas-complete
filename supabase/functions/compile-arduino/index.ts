@@ -33,20 +33,23 @@ const ARDUINO_CORE_STUBS = `
 typedef uint8_t byte;
 typedef bool boolean;
 
-// Timekeeping
+// Timekeeping (busy-wait based so sketches do not depend on interrupt vectors)
 volatile unsigned long _millis_count = 0;
-ISR(TIMER0_OVF_vect) { _millis_count++; }
 
 unsigned long millis() { return _millis_count; }
 unsigned long micros() { return _millis_count * 1000UL; }
 
 void delay(unsigned long ms) {
-  unsigned long start = millis();
-  while (millis() - start < ms) {}
+  while (ms--) {
+    _delay_ms(1);
+    _millis_count++;
+  }
 }
 
 void delayMicroseconds(unsigned int us) {
-  while (us--) { __asm__ __volatile__("nop"); }
+  while (us--) {
+    _delay_us(1);
+  }
 }
 
 // Digital I/O
@@ -202,7 +205,6 @@ long constrain(long x, long a, long b) {
 
 #define min(a,b) ((a)<(b)?(a):(b))
 #define max(a,b) ((a)>(b)?(a):(b))
-#define abs(x) ((x)>0?(x):-(x))
 
 // tone / noTone stubs
 void tone(uint8_t pin, unsigned int frequency, unsigned long duration = 0) {
@@ -214,16 +216,7 @@ void noTone(uint8_t pin) { (void)pin; }
 void setup();
 void loop();
 
-// Timer0 init for millis
-void _init_timer0() {
-  TCCR0A = (1 << WGM01) | (1 << WGM00);
-  TCCR0B = (1 << CS01) | (1 << CS00); // prescaler 64
-  TIMSK0 = (1 << TOIE0);
-}
-
 int main() {
-  _init_timer0();
-  sei();
   setup();
   while (1) loop();
   return 0;
@@ -435,33 +428,48 @@ const BOARD_CONFIGS: Record<string, { compiler: string; stubs: string; args: str
 
 const SUPPORTED_BOARD_IDS = Object.keys(BOARD_CONFIGS);
 
-// ELF to Intel HEX conversion
-function elfToHex(elfBase64: string): string {
-  const elfBytes = Uint8Array.from(atob(elfBase64), c => c.charCodeAt(0));
-  
-  const is32 = elfBytes[4] === 1;
-  if (!is32) throw new Error('Only 32-bit ELF supported');
-  
+// ELF to Intel HEX / flat binary conversion
+function decodeBase64(content: string): Uint8Array {
+  return Uint8Array.from(atob(content), c => c.charCodeAt(0));
+}
+
+function isElfBytes(bytes: Uint8Array): boolean {
+  return bytes.length >= 5
+    && bytes[0] === 0x7F
+    && bytes[1] === 0x45
+    && bytes[2] === 0x4C
+    && bytes[3] === 0x46
+    && bytes[4] === 0x01;
+}
+
+function parseElfExecutable(elfBase64: string): { entry: number; segments: { paddr: number; data: Uint8Array }[] } {
+  const elfBytes = decodeBase64(elfBase64);
+
+  if (!isElfBytes(elfBytes)) {
+    throw new Error('Artifact is not a 32-bit ELF executable');
+  }
+
   const littleEndian = elfBytes[5] === 1;
   const view = new DataView(elfBytes.buffer);
-  
+
   const readU16 = (off: number) => view.getUint16(off, littleEndian);
   const readU32 = (off: number) => view.getUint32(off, littleEndian);
-  
+
+  const entry = readU32(24);
   const phoff = readU32(28);
   const phentsize = readU16(42);
   const phnum = readU16(44);
-  
+
   const segments: { paddr: number; data: Uint8Array }[] = [];
   for (let i = 0; i < phnum; i++) {
     const off = phoff + i * phentsize;
     const pType = readU32(off);
     if (pType !== 1) continue;
-    
+
     const fileOff = readU32(off + 4);
     const paddr = readU32(off + 12);
     const filesz = readU32(off + 16);
-    
+
     if (filesz > 0) {
       segments.push({
         paddr,
@@ -469,35 +477,63 @@ function elfToHex(elfBase64: string): string {
       });
     }
   }
-  
+
   if (segments.length === 0) throw new Error('No loadable segments in ELF');
-  
+  return { entry, segments };
+}
+
+function encodeHexFromBytes(bytes: Uint8Array): string {
+  let hex = '';
+  for (let i = 0; i < bytes.length; i += 16) {
+    const chunkLen = Math.min(16, bytes.length - i);
+    const addr = i & 0xFFFF;
+
+    let line = `:${toHex8(chunkLen)}${toHex16(addr)}00`;
+    let checksum = chunkLen + (addr >> 8) + (addr & 0xFF);
+
+    for (let j = 0; j < chunkLen; j++) {
+      const b = bytes[i + j];
+      line += toHex8(b);
+      checksum += b;
+    }
+
+    line += toHex8((-checksum) & 0xFF);
+    hex += line + '\n';
+  }
+
+  hex += ':00000001FF\n';
+  return hex;
+}
+
+function elfToHex(elfBase64: string): string {
+  const { segments } = parseElfExecutable(elfBase64);
   let hex = '';
   for (const seg of segments) {
     const baseAddr = seg.paddr;
     const data = seg.data;
-    
+
     for (let i = 0; i < data.length; i += 16) {
       const chunkLen = Math.min(16, data.length - i);
       const addr = (baseAddr + i) & 0xFFFF;
-      
+
       let line = `:${toHex8(chunkLen)}${toHex16(addr)}00`;
       let checksum = chunkLen + (addr >> 8) + (addr & 0xFF) + 0x00;
-      
+
       for (let j = 0; j < chunkLen; j++) {
         const b = data[i + j];
         line += toHex8(b);
         checksum += b;
       }
-      
+
       line += toHex8((-checksum) & 0xFF);
       hex += line + '\n';
     }
   }
-  
+
   hex += ':00000001FF\n';
   return hex;
 }
+
 
 function toHex8(n: number): string {
   return n.toString(16).toUpperCase().padStart(2, '0');
@@ -531,7 +567,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const { sketch, board = 'uno' } = await req.json();
+    const { sketch, board = 'uno', debug = false } = await req.json();
     
     if (!sketch || typeof sketch !== 'string') {
       return new Response(
@@ -592,6 +628,31 @@ Deno.serve(async (req: Request) => {
 
     const result = await compileResponse.json();
 
+    if (debug) {
+      return new Response(
+        JSON.stringify({
+          code: result.code,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          asmSample: Array.isArray(result.asm) ? result.asm.slice(0, 12) : result.asm,
+          artifacts: Array.isArray(result.artifacts)
+            ? result.artifacts.map((artifact: Record<string, unknown>) => ({
+                name: artifact.name ?? null,
+                type: artifact.type ?? null,
+                title: artifact.title ?? null,
+                contentLength: typeof (artifact.content ?? artifact.base64 ?? artifact.data) === 'string'
+                  ? ((artifact.content ?? artifact.base64 ?? artifact.data) as string).length
+                  : null,
+                contentPrefix: typeof (artifact.content ?? artifact.base64 ?? artifact.data) === 'string'
+                  ? ((artifact.content ?? artifact.base64 ?? artifact.data) as string).slice(0, 32)
+                  : null,
+              }))
+            : result.artifacts,
+        }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
     // Check for compilation errors
     const stubs = boardConfig.stubs;
     const stderr = (result.stderr || []).map((s: { text: string }) => s.text).join('\n');
@@ -614,51 +675,209 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // Parse binary output from Godbolt
+    const artifactBase64 = Array.isArray(result.artifacts)
+      ? result.artifacts
+          .map((artifact: Record<string, unknown>) => {
+            const content = artifact.content ?? artifact.base64 ?? artifact.data;
+            if (typeof content !== 'string') return null;
+            try {
+              return isElfBytes(decodeBase64(content)) ? content : null;
+            } catch {
+              return null;
+            }
+          })
+          .find((content: string | null): content is string => Boolean(content))
+      : null;
+
+    if (!boardConfig.isArm && artifactBase64) {
+      try {
+        const { entry, segments } = parseElfExecutable(artifactBase64);
+        console.log('compile-arduino avr artifact', JSON.stringify({
+          board,
+          entry,
+          segmentCount: segments.length,
+          segments: segments.map((segment) => ({ paddr: segment.paddr, size: segment.data.length })),
+        }));
+
+        const maxSegmentEnd = segments.reduce((max, segment) => Math.max(max, segment.paddr + segment.data.length), 0);
+        const binaryData = new Uint8Array(maxSegmentEnd);
+        binaryData.fill(0xFF);
+
+        for (const segment of segments) {
+          binaryData.set(segment.data, segment.paddr);
+        }
+
+        if (binaryData.length >= 2 && binaryData[0] === 0xFF && binaryData[1] === 0xFF) {
+          const codeStart = entry;
+          if (codeStart < 0 || codeStart % 2 !== 0) {
+            throw new Error('ELF entry point is not a valid AVR instruction address');
+          }
+
+          const rjmpOffset = (codeStart / 2) - 1;
+          if (rjmpOffset < -2048 || rjmpOffset > 2047) {
+            throw new Error('ELF entry point is outside AVR RJMP range');
+          }
+
+          const encodedOffset = rjmpOffset & 0x0FFF;
+          binaryData[0] = encodedOffset & 0xFF;
+          binaryData[1] = 0xC0 | ((encodedOffset >> 8) & 0x0F);
+        }
+
+        return new Response(
+          JSON.stringify({
+            hex: encodeHexFromBytes(binaryData),
+            format: 'hex',
+            size: binaryData.length,
+            warnings: stderr || null,
+          }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (artifactError) {
+        console.log('compile-arduino avr artifact failed', artifactError instanceof Error ? artifactError.message : String(artifactError));
+        // Fall back to asm parsing below.
+      }
+    }
+
     const asmEntries = result.asm || [];
     const hexBytes: number[] = [];
     let maxAddr = 0;
 
+    const parseBytesFromText = (line: string): { addr: number; bytes: number[] } | null => {
+      const match = line.match(/^\s*([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{2}\s+)+)/);
+      if (!match) return null;
+
+      return {
+        addr: parseInt(match[1], 16),
+        bytes: match[2].trim().split(/\s+/).map((b: string) => parseInt(b, 16)),
+      };
+    };
+
+    const detectAvrAddressUnitBytes = (entries: Record<string, unknown>[]): 1 | 2 => {
+      const samples: Array<{ addr: number; size: number }> = [];
+
+      for (const entry of entries) {
+        let parsed: { addr: number; bytes: number[] } | null = null;
+
+        if (typeof entry.address === 'number' && entry.opcodes) {
+          const opcodes = Array.isArray(entry.opcodes)
+            ? entry.opcodes
+                .map((value) => typeof value === 'number' ? value : parseInt(String(value), 16))
+                .filter((value) => Number.isFinite(value) && value >= 0 && value <= 0xFF)
+            : (typeof entry.opcodes === 'string'
+              ? entry.opcodes.trim().split(/\s+/).map((b: string) => parseInt(b, 16))
+              : []);
+          if (opcodes.length > 0) {
+            parsed = { addr: entry.address, bytes: opcodes };
+          }
+        }
+
+        if (!parsed && typeof entry.text === 'string') {
+          parsed = parseBytesFromText(entry.text);
+        }
+
+        if (parsed && parsed.bytes.length > 0) {
+          samples.push({ addr: parsed.addr, size: parsed.bytes.length });
+        }
+
+        if (samples.length >= 16) break;
+      }
+
+      let byteAddressScore = 0;
+      let wordAddressScore = 0;
+      for (let i = 1; i < samples.length; i++) {
+        const delta = samples[i].addr - samples[i - 1].addr;
+        if (delta <= 0) continue;
+
+        if (delta === samples[i - 1].size || delta === samples[i].size) byteAddressScore++;
+        if (delta * 2 === samples[i - 1].size || delta * 2 === samples[i].size) wordAddressScore++;
+      }
+
+      return wordAddressScore > byteAddressScore ? 2 : 1;
+    };
+
+    const avrAddressUnitBytes = boardConfig.isArm ? 1 : detectAvrAddressUnitBytes(asmEntries);
+
+    const writeBytes = (addr: number, bytes: number[]) => {
+      const byteAddr = addr * avrAddressUnitBytes;
+      for (let i = 0; i < bytes.length; i++) {
+        const pos = byteAddr + i;
+        while (hexBytes.length <= pos) hexBytes.push(0xFF);
+        hexBytes[pos] = bytes[i];
+        if (pos + 1 > maxAddr) maxAddr = pos + 1;
+      }
+    };
+
     const sampleWithAddr = asmEntries.find((a: Record<string, unknown>) => a.address !== undefined);
+    const findAvrEntryPoint = (entries: Record<string, unknown>[], stubSource: string): number | null => {
+      const mainLine = stubSource.split('\n').findIndex((line) => line.includes('int main()')) + 1;
+
+      if (mainLine > 0) {
+        const sourceMappedEntry = entries.find((entry) => {
+          const source = entry.source;
+          return typeof entry.address === 'number'
+            && !!source
+            && typeof source === 'object'
+            && 'file' in source
+            && 'line' in source
+            && source.file === '<source>'
+            && typeof source.line === 'number'
+            && source.line >= mainLine
+            && source.line <= mainLine + 8;
+        });
+
+        if (sourceMappedEntry && typeof sourceMappedEntry.address === 'number') {
+          return sourceMappedEntry.address * avrAddressUnitBytes;
+        }
+      }
+
+      let sawMainLabel = false;
+      for (const entry of entries) {
+        const labels = Array.isArray(entry.labels) ? entry.labels : [];
+        const hasMainLabel = labels.some((label) => {
+          if (typeof label === 'string') return label === 'main';
+          return !!label && typeof label === 'object' && 'name' in label && label.name === 'main';
+        }) || (typeof entry.text === 'string' && /(^|\s|<)main[:>]/.test(entry.text));
+
+        if (hasMainLabel) sawMainLabel = true;
+        if (sawMainLabel && typeof entry.address === 'number') {
+          return entry.address * avrAddressUnitBytes;
+        }
+      }
+
+      return null;
+    };
+
+    const avrEntryPoint = !boardConfig.isArm ? findAvrEntryPoint(asmEntries, stubs) : null;
+
     const debugInfo = {
       totalAsmEntries: asmEntries.length,
       sampleKeys: sampleWithAddr ? Object.keys(sampleWithAddr) : [],
       sampleEntry: sampleWithAddr || null,
       firstFew: asmEntries.slice(0, 3),
+      avrEntryPoint,
+      avrAddressUnitBytes,
     };
 
     for (const entry of asmEntries) {
       if (entry.address !== undefined && entry.opcodes) {
         const addr = entry.address;
-        const opcodes: number[] = Array.isArray(entry.opcodes) 
-          ? entry.opcodes 
-          : (typeof entry.opcodes === 'string' 
+        const opcodes: number[] = Array.isArray(entry.opcodes)
+          ? entry.opcodes
+              .map((value) => typeof value === 'number' ? value : parseInt(String(value), 16))
+              .filter((value) => Number.isFinite(value) && value >= 0 && value <= 0xFF)
+          : (typeof entry.opcodes === 'string'
             ? entry.opcodes.trim().split(/\s+/).map((b: string) => parseInt(b, 16))
             : []);
-        
-        for (let i = 0; i < opcodes.length; i++) {
-          const pos = addr + i;
-          while (hexBytes.length <= pos) hexBytes.push(0xFF);
-          hexBytes[pos] = opcodes[i];
-          if (pos + 1 > maxAddr) maxAddr = pos + 1;
+
+        if (opcodes.length > 0) {
+          writeBytes(addr, opcodes);
         }
       }
-    }
 
-    // Fallback: try parsing hex bytes from text lines
-    if (maxAddr === 0) {
-      for (const entry of asmEntries) {
-        const line = entry.text || '';
-        const match = line.match(/^\s*([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{2}\s)+)/);
-        if (match) {
-          const addr = parseInt(match[1], 16);
-          const bytes = match[2].trim().split(/\s+/).map((b: string) => parseInt(b, 16));
-          for (let i = 0; i < bytes.length; i++) {
-            const pos = addr + i;
-            while (hexBytes.length <= pos) hexBytes.push(0xFF);
-            hexBytes[pos] = bytes[i];
-            if (pos + 1 > maxAddr) maxAddr = pos + 1;
-          }
+      if (typeof entry.text === 'string') {
+        const parsed = parseBytesFromText(entry.text);
+        if (parsed) {
+          writeBytes(parsed.addr, parsed.bytes);
         }
       }
     }
@@ -677,7 +896,47 @@ Deno.serve(async (req: Request) => {
 
     const binaryData = new Uint8Array(hexBytes.slice(0, maxAddr));
 
-    // For ARM boards, return raw binary (base64-encoded) instead of Intel HEX
+    // If AVR binary has empty reset vector (0xFFFF), construct RJMP to first real code
+    if (!boardConfig.isArm && binaryData.length >= 2 && binaryData[0] === 0xFF && binaryData[1] === 0xFF) {
+      let codeStart = typeof avrEntryPoint === 'number' ? avrEntryPoint : -1;
+
+      if (codeStart < 0) {
+        for (let i = 0; i < binaryData.length; i += 2) {
+          if (binaryData[i] !== 0xFF || (i + 1 < binaryData.length && binaryData[i + 1] !== 0xFF)) {
+            codeStart = i;
+            break;
+          }
+        }
+      }
+
+      if (codeStart < 0 || codeStart % 2 !== 0) {
+        return new Response(
+          JSON.stringify({
+            error: 'Compilation produced an empty AVR image with no executable entry point.',
+            debug: debugInfo,
+            warnings: stderr || null,
+          }),
+          { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      const rjmpOffset = (codeStart / 2) - 1;
+      if (rjmpOffset < -2048 || rjmpOffset > 2047) {
+        return new Response(
+          JSON.stringify({
+            error: 'Compilation produced an AVR entry point outside RJMP range.',
+            debug: debugInfo,
+            warnings: stderr || null,
+          }),
+          { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      const encodedOffset = rjmpOffset & 0x0FFF;
+      binaryData[0] = encodedOffset & 0xFF;
+      binaryData[1] = 0xC0 | ((encodedOffset >> 8) & 0x0F);
+    }
+
     if (boardConfig.isArm) {
       return new Response(
         JSON.stringify({
@@ -690,14 +949,13 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // For AVR boards, return Intel HEX
     let hexOutput = '';
     for (let i = 0; i < binaryData.length; i += 16) {
       const chunkLen = Math.min(16, binaryData.length - i);
       const addr = i & 0xFFFF;
 
       let line = `:${toHex8(chunkLen)}${toHex16(addr)}00`;
-      let checksum = chunkLen + (addr >> 8) + (addr & 0xFF) + 0x00;
+      let checksum = chunkLen + (addr >> 8) + (addr & 0xFF);
 
       for (let j = 0; j < chunkLen; j++) {
         const b = binaryData[i + j];
