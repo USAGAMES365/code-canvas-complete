@@ -552,6 +552,19 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+function parseOpcodeToken(token: string): number[] {
+  const normalized = token.trim().replace(/^0x/i, '').toLowerCase();
+  if (!/^[0-9a-f]+$/.test(normalized) || normalized.length === 0 || normalized.length % 2 !== 0) {
+    return [];
+  }
+
+  const bytes: number[] = [];
+  for (let i = 0; i < normalized.length; i += 2) {
+    bytes.push(parseInt(normalized.slice(i, i + 2), 16));
+  }
+  return bytes;
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
@@ -692,25 +705,30 @@ Deno.serve(async (req: Request) => {
     // Handle ELF artifact for ARM boards (e.g. R4 WiFi) — return flat binary
     if (boardConfig.isArm && artifactBase64) {
       try {
-        const { segments } = parseElfExecutable(artifactBase64);
+        const { entry, segments } = parseElfExecutable(artifactBase64);
         console.log('compile-arduino arm artifact', JSON.stringify({
           board,
+          entry,
           segmentCount: segments.length,
           segments: segments.map((segment) => ({ paddr: segment.paddr, size: segment.data.length })),
         }));
 
+        const minSegmentAddr = segments.reduce((m, s) => Math.min(m, s.paddr), Number.POSITIVE_INFINITY);
         const maxSegmentEnd = segments.reduce((m, s) => Math.max(m, s.paddr + s.data.length), 0);
-        const binaryData = new Uint8Array(maxSegmentEnd);
+        const binarySize = maxSegmentEnd - minSegmentAddr;
+        const binaryData = new Uint8Array(binarySize);
         binaryData.fill(0xFF);
         for (const segment of segments) {
-          binaryData.set(segment.data, segment.paddr);
+          binaryData.set(segment.data, segment.paddr - minSegmentAddr);
         }
 
         return new Response(
           JSON.stringify({
             binary: bytesToBase64(binaryData),
             format: 'bin',
-            size: maxSegmentEnd,
+            size: binarySize,
+            baseAddress: minSegmentAddr,
+            entryPoint: entry,
             warnings: stderr || null,
           }),
           { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -721,59 +739,10 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // Handle ELF artifact for AVR boards
-    if (!boardConfig.isArm && artifactBase64) {
-      try {
-        const { entry, segments } = parseElfExecutable(artifactBase64);
-        console.log('compile-arduino avr artifact', JSON.stringify({
-          board,
-          entry,
-          segmentCount: segments.length,
-          segments: segments.map((segment) => ({ paddr: segment.paddr, size: segment.data.length })),
-        }));
-
-        const maxSegmentEnd = segments.reduce((max, segment) => Math.max(max, segment.paddr + segment.data.length), 0);
-        const binaryData = new Uint8Array(maxSegmentEnd);
-        binaryData.fill(0xFF);
-
-        for (const segment of segments) {
-          binaryData.set(segment.data, segment.paddr);
-        }
-
-        if (binaryData.length >= 2 && binaryData[0] === 0xFF && binaryData[1] === 0xFF) {
-          const codeStart = entry;
-          if (codeStart < 0 || codeStart % 2 !== 0) {
-            throw new Error('ELF entry point is not a valid AVR instruction address');
-          }
-
-          const rjmpOffset = (codeStart / 2) - 1;
-          if (rjmpOffset < -2048 || rjmpOffset > 2047) {
-            throw new Error('ELF entry point is outside AVR RJMP range');
-          }
-
-          const encodedOffset = rjmpOffset & 0x0FFF;
-          binaryData[0] = encodedOffset & 0xFF;
-          binaryData[1] = 0xC0 | ((encodedOffset >> 8) & 0x0F);
-        }
-
-        return new Response(
-          JSON.stringify({
-            hex: encodeHexFromBytes(binaryData),
-            format: 'hex',
-            size: binaryData.length,
-            warnings: stderr || null,
-          }),
-          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      } catch (artifactError) {
-        console.log('compile-arduino avr artifact failed', artifactError instanceof Error ? artifactError.message : String(artifactError));
-        // Fall back to asm parsing below.
-      }
-    }
-
     const asmEntries = result.asm || [];
     const hexBytes: number[] = [];
     let maxAddr = 0;
+    let minAddr = Number.POSITIVE_INFINITY;
 
     const parseBytesFromText = (line: string): { addr: number; bytes: number[] } | null => {
       const match = line.match(/^\s*([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{2}\s+)+)/);
@@ -794,10 +763,12 @@ Deno.serve(async (req: Request) => {
         if (typeof entry.address === 'number' && entry.opcodes) {
           const opcodes = Array.isArray(entry.opcodes)
             ? entry.opcodes
-                .map((value) => typeof value === 'number' ? value : parseInt(String(value), 16))
+                .flatMap((value) => typeof value === 'number'
+                  ? [value]
+                  : parseOpcodeToken(String(value)))
                 .filter((value) => Number.isFinite(value) && value >= 0 && value <= 0xFF)
             : (typeof entry.opcodes === 'string'
-              ? entry.opcodes.trim().split(/\s+/).map((b: string) => parseInt(b, 16))
+              ? entry.opcodes.trim().split(/\s+/).flatMap((token: string) => parseOpcodeToken(token))
               : []);
           if (opcodes.length > 0) {
             parsed = { addr: entry.address, bytes: opcodes };
@@ -832,6 +803,7 @@ Deno.serve(async (req: Request) => {
 
     const writeBytes = (addr: number, bytes: number[]) => {
       const byteAddr = addr * avrAddressUnitBytes;
+      if (byteAddr < minAddr) minAddr = byteAddr;
       for (let i = 0; i < bytes.length; i++) {
         const pos = byteAddr + i;
         while (hexBytes.length <= pos) hexBytes.push(0xFF);
@@ -889,6 +861,7 @@ Deno.serve(async (req: Request) => {
       firstFew: asmEntries.slice(0, 3),
       avrEntryPoint,
       avrAddressUnitBytes,
+      minAddr: Number.isFinite(minAddr) ? minAddr : null,
     };
 
     for (const entry of asmEntries) {
@@ -896,10 +869,10 @@ Deno.serve(async (req: Request) => {
         const addr = entry.address;
         const opcodes: number[] = Array.isArray(entry.opcodes)
           ? entry.opcodes
-              .map((value: number | string) => typeof value === 'number' ? value : parseInt(String(value), 16))
+              .flatMap((value: number | string) => typeof value === 'number' ? [value] : parseOpcodeToken(String(value)))
               .filter((value: number) => Number.isFinite(value) && value >= 0 && value <= 0xFF)
           : (typeof entry.opcodes === 'string'
-            ? entry.opcodes.trim().split(/\s+/).map((b: string) => parseInt(b, 16))
+            ? entry.opcodes.trim().split(/\s+/).flatMap((token: string) => parseOpcodeToken(token))
             : []);
 
         if (opcodes.length > 0) {
@@ -916,6 +889,17 @@ Deno.serve(async (req: Request) => {
     }
 
     if (maxAddr === 0) {
+      if (boardConfig.isArm && asmEntries.length > 0) {
+        return new Response(
+          JSON.stringify({
+            binary: bytesToBase64(new Uint8Array()),
+            format: 'bin',
+            size: 0,
+            warnings: stderr || null,
+          }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
       return new Response(
         JSON.stringify({
           compiled: true,
@@ -971,11 +955,14 @@ Deno.serve(async (req: Request) => {
     }
 
     if (boardConfig.isArm) {
+      const armBaseAddress = Number.isFinite(minAddr) ? minAddr : 0;
+      const armBinaryData = binaryData.slice(armBaseAddress);
       return new Response(
         JSON.stringify({
-          binary: bytesToBase64(binaryData),
+          binary: bytesToBase64(armBinaryData),
           format: 'bin',
-          size: maxAddr,
+          size: armBinaryData.length,
+          baseAddress: armBaseAddress,
           warnings: stderr || null,
         }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }

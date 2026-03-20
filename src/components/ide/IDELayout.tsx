@@ -1060,28 +1060,57 @@ export const IDELayout = ({ projectId, publishSlug }: IDELayoutProps) => {
     [addHistoryEntry, collab, files, openTabs],
   );
 
-  // helper that wraps createFile and also sets initial content
+  const handleCreateOrUpdateFile = useCallback(
+    (name: string, content: string, language?: string) => {
+      const findByName = (nodes: FileNode[]): FileNode | null => {
+        for (const node of nodes) {
+          if (node.type === "file" && node.name === name) return node;
+          if (node.children) {
+            const found = findByName(node.children);
+            if (found) return found;
+          }
+        }
+        return null;
+      };
+
+      const existing = findByName(files);
+      if (existing) {
+        handleContentChange(existing.id, content);
+        handleFileSelect(existing);
+        return;
+      }
+
+      const newFileId = generateId();
+      const newFile: FileNode = {
+        id: newFileId,
+        name,
+        type: "file",
+        content,
+        language: language || getFileLanguage(name),
+      };
+
+      setFiles((prev) => {
+        const root = prev[0];
+        if (root && root.type === "folder") {
+          return [{ ...root, children: [...(root.children || []), newFile] }];
+        }
+        return [...prev, newFile];
+      });
+      setFileContents((prev) => ({ ...prev, [newFileId]: content }));
+      const newTab: Tab = { id: generateId(), name, fileId: newFileId, isModified: true };
+      setOpenTabs((prev) => [...prev, newTab]);
+      setActiveTabId(newTab.id);
+      addHistoryEntry("file-create", `Created: ${name}`, "generated content");
+    },
+    [addHistoryEntry, files, handleContentChange, handleFileSelect],
+  );
+
+  // helper kept for existing integrations like Arduino panel
   const addFile = useCallback(
     (name: string, content: string, language?: string) => {
-      handleCreateFile(null, name, "file");
-      setTimeout(() => {
-        const findAndSet = (nodes: FileNode[]): string | null => {
-          for (const node of nodes) {
-            if (node.type === "file" && node.name === name) {
-              handleContentChange(node.id, content);
-              return node.id;
-            }
-            if (node.children) {
-              const res = findAndSet(node.children);
-              if (res) return res;
-            }
-          }
-          return null;
-        };
-        findAndSet(files);
-      }, 0);
+      handleCreateOrUpdateFile(name, content, language);
     },
-    [handleCreateFile, handleContentChange, files],
+    [handleCreateOrUpdateFile],
   );
 
   const handleCommand = useCallback(
@@ -1841,7 +1870,7 @@ export const IDELayout = ({ projectId, publishSlug }: IDELayoutProps) => {
           <div
             className={cn(
               "hidden md:block transition-all duration-200 border-r border-border overflow-hidden",
-              isSidebarOpen ? "w-[28rem]" : "w-0",
+              isSidebarOpen ? "w-[22rem] xl:w-[24rem]" : "w-0",
             )}
           >
             <Sidebar
@@ -1905,7 +1934,7 @@ export const IDELayout = ({ projectId, publishSlug }: IDELayoutProps) => {
                     onTabClose={handleTabClose}
                   />
                   <div className="flex-1 overflow-hidden">
-                    <CodeEditor file={activeFileWithContent} currentFilePath={activeFilePath} onContentChange={handleContentChange} collab={collab} />
+                    <CodeEditor file={activeFileWithContent} allFiles={filesWithContent} currentFilePath={activeFilePath} onContentChange={handleContentChange} onCreateOrUpdateFile={handleCreateOrUpdateFile} collab={collab} />
                   </div>
                 </div>
               )}
@@ -1978,7 +2007,7 @@ export const IDELayout = ({ projectId, publishSlug }: IDELayoutProps) => {
               {/* Editor panel - hidden for scratch template */}
               {selectedTemplate !== "scratch" && (
                 <>
-                  <ResizablePanel defaultSize={50} minSize={30}>
+                  <ResizablePanel defaultSize={54} minSize={34}>
                     <div className="h-full flex flex-col">
                       <EditorTabs
                         tabs={openTabs}
@@ -1987,7 +2016,7 @@ export const IDELayout = ({ projectId, publishSlug }: IDELayoutProps) => {
                         onTabClose={handleTabClose}
                       />
                       <div className="flex-1 flex flex-col overflow-hidden">
-                        <CodeEditor file={activeFileWithContent} currentFilePath={activeFilePath} onContentChange={handleContentChange} collab={collab} />
+                        <CodeEditor file={activeFileWithContent} allFiles={filesWithContent} currentFilePath={activeFilePath} onContentChange={handleContentChange} onCreateOrUpdateFile={handleCreateOrUpdateFile} collab={collab} />
                         <Terminal
                           history={terminalHistory}
                           onCommand={handleCommand}
@@ -2005,7 +2034,7 @@ export const IDELayout = ({ projectId, publishSlug }: IDELayoutProps) => {
               )}
 
               {/* Preview panel or Arduino/Scratch panel */}
-              <ResizablePanel defaultSize={selectedTemplate === "scratch" ? 100 : 50} minSize={20}>
+              <ResizablePanel defaultSize={selectedTemplate === "scratch" ? 100 : 46} minSize={24}>
                 {selectedTemplate === "arduino" ? (
                   <Suspense fallback={<div className="p-4 text-gray-400">Loading Arduino panel...</div>}>
                     <ArduinoPanel
