@@ -1,10 +1,9 @@
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/TopProjectsCreator/code-canvas-complete)
-[![GitHub](https://img.shields.io/badge/GitHub-code--canvas--complete-181717?logo=github)](https://github.com/TopProjectsCreator/code-canvas-complete)
-
-
 
 
 # Code Canvas Complete
+
+
 
 Code Canvas Complete is a browser-based coding workspace with an integrated AI assistant, multi-file editing, workflow automation, package management helpers, and optional BYOK (bring-your-own-key) model routing.
 
